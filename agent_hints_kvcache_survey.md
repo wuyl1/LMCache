@@ -512,7 +512,7 @@ RESPONSE           优先驱逐
 
 前面几节分别讨论了语义提示、外置 KV 管理和分布式路由。把这些思路落到 MORI-UMBP 时，需要先明确 UMBP 的定位：它更像一个高性能 KV cache 数据平面和分层内存池，而不是 Agent 编排器或 LLM 推理引擎本身。当前 UMBP 已经具备 HBM/DRAM/SSD tier、master-as-advisor 路由、peer-owned allocator、external KV block index、hit count、read lease、prefix-aware eviction 和 eviction manager 等基础能力。[M1][M2][M3][M4][M5][M6]
 
-因此，比较合适的方向不是把 Sutradhara 整套 co-design 直接搬进 UMBP，而是在 UMBP 上方增加一层 **Semantic KV Manager**：Agent/推理框架负责产生语义 hints，adapter 把 hints 转换成 key、tier、路由和驱逐策略，UMBP 继续负责高性能存储与搬运。
+因此，比较合适的方向不是把 Sutradhara 整套 co-design 直接搬进 UMBP core，而是在 UMBP 外侧增加一层 **Semantic KV Adapter**：Agent/推理框架负责提供语义上下文，adapter 把这些上下文转换成 UMBP 现有 primitives 可以消费的 key、tier、routing、external KV report/match 和 eviction policy 输入；UMBP core 继续只负责高性能存储与搬运。
 
 ### 7.1 设计目标
 
@@ -520,24 +520,25 @@ RESPONSE           优先驱逐
 
 | 职责层 | 主要落点 | 做什么 |
 |---|---|---|
-| **语义层** | Agent Orchestrator / SGLang / vLLM adapter | 识别 prompt 结构，产生 `SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / RESPONSE / PARTIAL_PREFILL` 等语义 hints。 |
+| **语义层** | Agent Orchestrator / Prompt Builder / Tool Runtime / RAG layer / vLLM-SGLang adapter | 从 message role、tool event、retrieved context、session/workflow metadata 中提取语义上下文；如果上层框架不原生输出 hints，就由 adapter 或中间层生成 `SemanticKvHint`。 |
 | **隔离层** | UMBP Semantic KV Adapter | 生成带 `tenant_id / agent_id / workflow_id / session_id / phase` 的 cache key，避免跨租户或跨任务错误复用。 |
-| **分层层** | UMBP Semantic KV Adapter + MORI-UMBP | 把语义 hint 转成 HBM/DRAM/SSD tier policy：高价值 KV 留在近端高性能 tier，低价值或冷数据下沉到 SSD 或直接不保存。 |
-| **路由层** | UMBP Semantic KV Adapter + UMBP master | 复用 master-as-advisor、`GlobalBlockIndex`、`ExternalKvBlockIndex`、`RouteGet` 等能力，让请求优先命中已有 KV 的节点。 |
+| **分层层** | UMBP Semantic KV Adapter + MORI-UMBP primitives | Adapter 把语义 hint 转成 tier policy；MORI-UMBP 只执行 HBM/DRAM/SSD 存储和搬运。 |
+| **路由层** | UMBP Semantic KV Adapter + UMBP master primitives | Adapter 选择如何查询和打分；UMBP master 继续提供 master-as-advisor、`GlobalBlockIndex`、`ExternalKvBlockIndex`、`RouteGet` 等基础能力。 |
 
-也就是说，UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector 或 UMBP adapter 中。当前 UMBP repo 内没有 prompt、tool call、agent session 等一等公民对象，因此不要假设 UMBP 能直接产生 Sutradhara 式语义标签。
+也就是说，UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector、Hint Producer 或 UMBP Semantic KV Adapter 中。当前 UMBP repo 内没有 prompt、tool call、agent session 等一等公民对象，因此不要假设 UMBP 能直接产生或理解 Sutradhara 式语义标签。
 
 ### 7.2 建议架构
 
 ```text
 Agent Orchestrator / SGLang / vLLM
         │
-        ├─ 语义层：识别 prompt span，生成 SemanticKvHint
+        ├─ 语义层：提供 messages / tool events / RAG context / session metadata
         │
-        │  Semantic KV Hints
+        │  semantic context
         ▼
 UMBP Semantic KV Adapter
         │
+        ├─ Hint Producer：从 semantic context 生成 SemanticKvHint
         ├─ 隔离层：生成 canonical cache key
         ├─ 按 token span 切分 page / chunk
         ├─ 分层层：把 semantic class 转成 tier policy / eviction priority
@@ -552,7 +553,7 @@ MORI-UMBP
         └─ 现有冷层存储：PeerSsdManager, SSD cold tier and local LRU
 ```
 
-因此，四层和三块组件不是一一对应关系。Agent/推理框架主要负责语义层；adapter 是核心翻译层，承担隔离、分层策略和路由策略；MORI-UMBP 提供已有的路由索引、分层存储、跨节点查找和 KV 搬运能力。语义感知路由、语义分层和语义驱逐不是 UMBP 当前原生能力，需要由 adapter 和后续策略扩展补上。
+因此，四层和三块组件不是一一对应关系。Agent/推理框架主要提供可提取语义的上下文；adapter 是核心翻译层，负责生成 hints、cache key、分层策略和路由策略；MORI-UMBP 提供已有的路由索引、分层存储、跨节点查找和 KV 搬运能力。语义感知路由、语义分层和语义驱逐不是 UMBP 当前原生能力，也不建议直接塞进 UMBP core，而应由 adapter 和后续策略扩展补上。
 
 这套架构最重要的约束，是不要让 UMBP master 变成强一致 metadata 数据库。Mori 当前设计明确是 master-as-advisor：master 不拥有 page 状态，peer 才是 KV block 的真实 owner，master 只通过 heartbeat 投影 `GlobalBlockIndex`。[M2] 语义扩展也应保持这个方向：master 可以保存轻量 semantic summary 用于路由和驱逐排序，但不能把每次 token span 更新变成同步 master 写路径。
 
@@ -706,6 +707,7 @@ RESPONSE         低，优先驱逐或默认 skip-save
 ### 7.10 风险与边界
 
 - **UMBP 不应负责解析 prompt。** 语义识别应由 Agent orchestrator 或推理框架 adapter 完成。
+- **Semantic KV Adapter 是可选增强层，不是 UMBP core 的一部分。** 没有 hint producer 时，UMBP 仍然按 opaque key 做普通 KV block pool；它不会自动获得语义感知路由、语义分层或语义驱逐收益。
 - **不要默认跨租户复用。** 只有明确 `reuse_scope = GLOBAL` 的 KV 才能跨 tenant。
 - **master 不应变成强一致目录。** 语义 metadata 要保持轻量、异步、可重建，符合 master-as-advisor 设计。
 - **client tags 不是现成路由策略。** 当前更接近注册/metrics 标签；要用于语义路由，需要扩展 routing strategy。
