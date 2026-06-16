@@ -477,7 +477,7 @@ RESPONSE           优先驱逐
 
 ## 7. 面向 UMBP 的 Semantic KV Cache 管理系统设计
 
-这一节面向 `C:\Users\yangwu\Desktop\Git\mori` 中的 MORI-UMBP。结合当前 Mori 文档和测试，UMBP 更像一个高性能 KV cache 数据平面和分层内存池，而不是 Agent 编排器或 LLM 推理引擎本身。它已经具备 HBM/DRAM/SSD tier、master-as-advisor 路由、peer-owned allocator、external KV block index、hit count、read lease 和 eviction manager 等基础能力。[M1][M2][M3][M4][M5]
+这一节面向 `C:\Users\yangwu\Desktop\Git\mori` 中的 MORI-UMBP。结合当前 Mori 文档和测试，UMBP 更像一个高性能 KV cache 数据平面和分层内存池，而不是 Agent 编排器或 LLM 推理引擎本身。它已经具备 HBM/DRAM/SSD tier、master-as-advisor 路由、peer-owned allocator、external KV block index、hit count、read lease、prefix-aware eviction 和 eviction manager 等基础能力。[M1][M2][M3][M4][M5][M6]
 
 因此，比较合适的设计不是把 Sutradhara 整套 co-design 直接搬进 UMBP，而是在 UMBP 上方增加一层 **Semantic KV Manager**：由 Agent/推理框架负责产生语义 hints，UMBP 负责把这些 hints 转换为 key、tier、路由和驱逐策略。
 
@@ -490,7 +490,7 @@ RESPONSE           优先驱逐
 3. **路由层**：复用 UMBP master 的 advisor 模型和 external KV index，让请求优先路由到已经持有相关 KV block 的节点。
 4. **隔离层**：借鉴 LMCache 的 `lmcache.tag.*` 思路，把 tenant、agent、workflow、session、phase 放入逻辑 cache identity，避免跨租户或跨任务错误复用。
 
-这个设计的定位是：UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector 或 UMBP adapter 中。
+这个设计的定位是：UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector 或 UMBP adapter 中。当前 UMBP repo 内没有 prompt、tool call、agent session 等一等公民对象，因此不要假设 UMBP 能直接产生 Sutradhara 式语义标签。
 
 ### 7.2 建议架构
 
@@ -615,13 +615,17 @@ RESPONSE         低，优先驱逐或默认 skip-save
 | KV-aware routing | `ExternalKvBlockIndex`、`match_external_kv()`、hit count | 按 phase/session/tenant 聚合匹配 |
 | 防止读取中被驱逐 | `GrantLease`、peer read lease | partial prefill pin 事件 |
 | 容量回收 | master HBM/DRAM eviction，peer-local SSD LRU | semantic priority eviction |
-| 租户隔离 | SPDK proxy tenant id、client tags、外部 key namespace | 显式 cache key schema 和 quota 维度 |
+| 前缀保留 | prefix-aware LRU、`BatchPutWithDepth` 风格的深度信号 | 把语义 phase 映射成 depth / priority |
+| 租户隔离 | SPDK proxy tenant id、外部 key namespace | 显式 cache key schema 和 quota 维度 |
+| 粗粒度标签 | client registration tags | 当前主要用于 metrics/observability；若用于路由需扩展策略 |
 
 ### 7.8 建议分阶段落地
 
 **阶段 1：只做语义 key 和 external KV routing。**
 
 在 SGLang/vLLM adapter 中生成 `SemanticKvHint`，把 `SYSTEM_PROMPT`、`TOOL_OUTPUT` 等 phase 进入 cache key namespace；KV bytes 仍由引擎持有，只通过 `report_external_kv_blocks()` 上报 hash 到 UMBP master。router 根据 `match_external_kv()` 结果做节点亲和。
+
+如果先不改 master 数据结构，可以把 `SYSTEM_PROMPT` 等稳定前缀映射为更大的 prefix depth，复用现有 prefix-aware LRU；但这只是位置/链路深度信号，不等价于真正的 `SYSTEM_PROMPT` 语义枚举。
 
 **阶段 2：接入 UMBP-owned KV for 高价值前缀。**
 
@@ -640,6 +644,7 @@ RESPONSE         低，优先驱逐或默认 skip-save
 - **UMBP 不应负责解析 prompt。** 语义识别应由 Agent orchestrator 或推理框架 adapter 完成。
 - **不要默认跨租户复用。** 只有明确 `reuse_scope = GLOBAL` 的 KV 才能跨 tenant。
 - **master 不应变成强一致目录。** 语义 metadata 要保持轻量、异步、可重建，符合 master-as-advisor 设计。
+- **client tags 不是现成路由策略。** 当前更接近注册/metrics 标签；要用于语义路由，需要扩展 routing strategy。
 - **partial prefill 不是纯 cache 功能。** 它需要引擎能提前 prefill、暂停、扩展上下文；UMBP 只能提供 KV 存储、pin 和跨节点搬运。
 - **SSD 适合兜底，不适合热路径默认读取。** UMBP 当前 `RouteGet` 已按 HBM > DRAM > SSD 选择 tier，语义策略应顺着这个模型，而不是让高频请求频繁走 SSD。
 
@@ -719,3 +724,4 @@ Sutradhara、LMCache、Dynamo 代表了 Agent Hints 在 KV Cache 系统中的三
 - [M3] `C:\Users\yangwu\Desktop\Git\mori\src\umbp\doc\runtime-env-vars.md`：UMBP runtime knobs，包括 heartbeat、lease、SSD、SPDK proxy tenant quota、`UMBP_CACHE_REMOTE_FETCHES` 等。
 - [M4] `C:\Users\yangwu\Desktop\Git\mori\tests\python\umbp\test_umbp_client_ptr.py`：Python `UMBPClient` 指针 API 示例，包括 `put_from_ptr`、`get_into_ptr`、`batch_put_from_ptr`、`batch_get_into_ptr` 和 SSD-enabled round trip。
 - [M5] `C:\Users\yangwu\Desktop\Git\mori\tests\python\umbp\test_umbp_master_client.py`：External KV block report/match/revoke、multi-tier registration、hit count 和 master client 行为测试。
+- [M6] `C:\Users\yangwu\Desktop\Git\mori\src\umbp\include\umbp\umbp_client.h`、`C:\Users\yangwu\Desktop\Git\mori\src\umbp\local\tiers\local_storage_manager.cpp`、`C:\Users\yangwu\Desktop\Git\mori\tests\cpp\umbp\local\test_prefix_aware_eviction.cpp`：`BatchPutWithDepth` 和 `prefix_aware_lru` 使用 radix-tree chain depth 作为本地 eviction priority 信号。
