@@ -4,7 +4,7 @@
 
 本文分两类来源：
 
-- **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制参考用户提供的调研报告 `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`，并补充核对了公开网络资料：Sutradhara arXiv HTML、Microsoft Research 发布页、NVIDIA Dynamo 官方 Agents 文档、NeMo Agent Toolkit 的 Dynamo LLM provider 源码/文档，以及 Dynamo Router README。[R1][R2][R3][R4][R5][R6][R7][R8]
+- **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制参考用户提供的调研报告 `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`，并补充核对了公开网络资料：Sutradhara arXiv HTML、Microsoft Research 发布页、NVIDIA Dynamo 官方 Agents 文档、NeMo Agent Toolkit 的 Dynamo LLM provider 源码/文档、Dynamo Router README，以及 LMCache arXiv HTML。[R1][R2][R3][R4][R5][R6][R7][R8][R9]
 - **LMCache 当前实现**：LMCache 相关结论基于当前仓库代码核对，包括 vLLM adapter、cache key、token database、cache engine、multiprocess connector、storage backend 和配置文件。[C1][C2][C3][C4][C5][C6][C7][C8]
 
 因此，本文中“LMCache 当前没有原生 `agent_hints`”指的是：在当前仓库中未发现 Dynamo 风格 `nvext.agent_hints`、Sutradhara 风格语义标签 API，或基于 `SYSTEM_PROMPT / RESPONSE / TOOL_OUTPUT` 的原生语义驱逐策略。
@@ -389,75 +389,48 @@ nvext.agent_hints
 | 主要优势 | 语义表达强，优化潜力大 | 兼容性强，KV 管理能力完整 | 分布式路由效果强 |
 | 主要局限 | 改造引擎成本高 | 不原生理解 Agent 语义 | 不做细粒度语义 KV 管理 |
 
-### 5.1 性能收益对比图
+### 5.1 性能收益图引用
 
-> 注意：以下图表来自不同论文、报告或官方材料中的实验结果，硬件、模型、负载、baseline 和指标定义并不完全一致。因此这些图适合说明“各类机制可能带来的收益方向和量级”，不适合作为严格的横向 benchmark。
+> 注意：以下图片直接引用论文或官方公开资料中的原图。不同系统的硬件、模型、负载、baseline 和指标定义并不完全一致，因此这些图适合说明“机制带来的收益方向和量级”，不适合作为严格横向 benchmark。
 
-#### 5.1.1 Sutradhara：同负载下延迟降低与负载提升
+#### 5.1.1 Sutradhara：论文 Figure 8 / 10 / 11
 
-Sutradhara 的公开资料和报告显示，它通过工具执行与 prefill 重叠、流式工具调度、语义提示驱动的 KV cache 管理，在 vLLM/A100 相关实验中降低 FTR 和端到端延迟；报告还提到在相同中位数 FTR 延迟下可支持更高负载。[R1][R5]
+Sutradhara 论文 Figure 8 给出 serving capacity curves：横轴是 p50/p90 FTR 与 E2E 延迟，纵轴是 ingest load；曲线越靠左上角越好。论文结论是：在相同 p50 FTR 延迟下，Sutradhara 最多可承载 77% 更高负载；固定负载下，p50 FTR 最多降低 15%，p90 FTR 最多降低 11%，p90 E2E 最多降低 9%。[R4][R5]
 
-```mermaid
-xychart-beta
-    title "Sutradhara 性能收益（百分比）"
-    x-axis ["Median FTR 延迟降低", "端到端延迟降低", "相同 FTR 下负载提升"]
-    y-axis "百分比（%）" 0 --> 80
-    bar [15, 10, 77]
-```
+![Sutradhara Figure 8: serving capacity curves](https://arxiv.org/html/2601.12967v3/x8.png)
 
-说明：
+论文 Figure 10 进一步拆解 FTR 延迟来源，把代表性请求的 FTR 分为 critical path tool time、prefill time 和 decode time。它说明 Sutradhara 的收益不是单纯来自“缓存命中更多”，还来自流式工具调度降低 critical path tool time，以及 partial prefill / 更高命中率降低 prefill time。[R4]
 
-- `Median FTR 延迟降低 15%` 和 `端到端延迟降低约 10%` 来自 Microsoft Research 发布页。[R5]
-- `相同中位数 FTR 延迟下负载提升 77%` 来自用户提供报告中对 Sutradhara 实验结果的整理。[R1]
-- 这些收益主要来自 co-design：`submit_partial_prefill()` 提前计算工具无关前缀，`extend_prefill()` 在工具结果返回后扩展，`tag_kv_blocks()` / `set_reuse_priority()` 指导 KV cache 管理。[R4]
+![Sutradhara Figure 10: FTR latency breakdown](https://arxiv.org/html/2601.12967v3/x10.png)
 
-#### 5.1.2 Dynamo KV Router：相对轮询路由的加速比
+论文 Figure 11 展示 inter-request 与 intra-request cache hit rate。论文文本说明，全局 cache hit rate 从 21.8% 提升到 44.6%；原因是系统提示词等共享前缀更不容易被驱逐，同时 partial prefill 中包含的前序工具结果也更容易被后续 iteration 复用。[R4]
+
+![Sutradhara Figure 11: cache hit rate analysis](https://arxiv.org/html/2601.12967v3/x11.png)
+
+#### 5.1.2 Dynamo KV Router：官方资料边界
 
 报告中整理的 Dynamo KV Router 结果显示，在 Mooncake Tool Agent Traces 类场景下，KV-aware routing 相比轮询路由显著降低 TTFT 和端到端延迟。[R2]
-
-```mermaid
-xychart-beta
-    title "Dynamo KV Router 相对轮询路由的加速比"
-    x-axis ["TTFT 平均值", "TTFT P99", "E2E 平均值", "E2E P99"]
-    y-axis "加速比（x）" 0 --> 22
-    bar [20.4, 15.9, 4.3, 3.8]
-```
 
 说明：
 
 - `TTFT 平均值约 20.4x`、`TTFT P99 约 15.9x`、`E2E 平均值约 4.3x`、`E2E P99 约 3.8x` 来自用户提供报告中对 Dynamo KV Router benchmark 的整理。[R2]
 - Dynamo Router README 说明 KV Router 会利用 KV cache overlap 和 worker 的 prefill/decode cost 做路由，减少重复 prefill；这解释了为什么长系统提示词、Agent 多轮前缀复用场景下收益明显。[R8]
 - Dynamo 的 `nvext.agent_hints` 和 `nvext.cache_control` 可进一步传递请求优先级、输出长度估计、prefix/session 相关信息，辅助路由和缓存生命周期控制。[R6][R7]
+- 当前可核验的 Dynamo 官方 Router 文档主要是机制说明和配置说明，没有在该 README 中提供可直接嵌入的论文性能图；因此这里不再自绘柱状图。
 
-#### 5.1.3 LMCache：报告中的系统级收益与当前文档解释边界
+#### 5.1.3 LMCache：论文 Figure 8
 
-用户提供报告将 LMCache 描述为外置 KV Cache 管理层，并整理了 LMCache 在本地前缀缓存、分布式前缀复用、PD 分离等设置中的系统级收益：最高 15x 吞吐量提升、至少 2x 延迟降低。[R3]
+LMCache 论文 Figure 8 对比了 basic vLLM、basic vLLM CPU offloading、两个商业方案和 LMCache。论文图注说明，LMCache 有 1.9-8.1x 更小 TTFT，并支持 2.3-14x 更高 inference throughput；论文摘要和评估部分还总结其在多类设置下可达到最高 15x 吞吐量提升、至少 2x 延迟降低。[R9]
 
-```mermaid
-xychart-beta
-    title "LMCache 报告中整理的系统级收益"
-    x-axis ["吞吐量提升", "延迟降低"]
-    y-axis "倍数（x）" 0 --> 16
-    bar [15, 2]
-```
+![LMCache Figure 8: TTFT and throughput comparison](https://arxiv.org/html/2510.09665/x8.png)
 
 说明：
 
-- 这里展示的是报告中对 LMCache 论文/资料的概括性结果，不是本文在本地仓库重新复现实验的结果。[R3]
+- 这里引用的是 LMCache 论文原图，不是本文在本地仓库重新复现实验的结果。[R9]
 - 结合当前代码看，LMCache 的性能收益主要来自外置 KV 管理：`lookup` 发现前缀命中，`pin` 防止 retrieve 前淘汰，`retrieve` 把 KV 加载回引擎，`move/clear/compress` 支持缓存迁移、清理和存储优化。[C3][C4][C5]
 - 这些收益不依赖 LMCache 原生理解 `SYSTEM_PROMPT`。LMCache 当前复用的是精确 token 前缀；系统提示词能受益，是因为它通常稳定地位于 prompt 前缀。[C2][C3]
 
 #### 5.1.4 三类机制的收益来源对比
-
-```mermaid
-flowchart LR
-    A[Sutradhara<br/>语义标记 + partial prefill] --> A1[减少工具等待与重复 prefill]
-    A --> A2[高价值 KV 最后驱逐]
-    B[Dynamo<br/>nvext.agent_hints + KV Router] --> B1[相关请求路由到有 KV 的 Worker]
-    B --> B2[结合优先级与负载做调度]
-    C[LMCache<br/>外置 KV Cache 管理] --> C1[跨请求保存与加载 KV]
-    C --> C2[分层存储、pin、move、compress]
-```
 
 | 系统 | 主要性能收益来源 | 适合场景 | 注意事项 |
 |---|---|---|---|
@@ -532,6 +505,7 @@ Sutradhara、LMCache、Dynamo 代表了 Agent Hints 在 KV Cache 系统中的三
 - [R6] NVIDIA Dynamo 官方 Agents 文档：`https://docs.dynamo.nvidia.com/dynamo/user-guides/agents`。该页说明 agent-facing request metadata 位于 `nvext`，`agent_hints` 可携带 priority、expected output length、speculative prefill 等 serving-relevant intent，并提到 priority、osl、planned `context_type` 等字段。
 - [R7] NVIDIA NeMo Agent Toolkit Dynamo LLM provider 源码/文档：`https://github.com/NVIDIA/NeMo-Agent-Toolkit/blob/develop/packages/nvidia_nat_core/src/nat/llm/dynamo_llm.py` 与 `https://docs.nvidia.com/nemo/agent-toolkit/latest/api/nat/llm/dynamo_llm/index.html`。该实现说明所有 routing hints 注入到 `nvext.agent_hints`，标准字段包括 `latency_sensitivity`、`osl`、`priority`，自定义字段包括 `prefix_id`、`total_requests`、`iat`，并注入 `nvext.cache_control`。
 - [R8] Dynamo Router README：`https://github.com/ai-dynamo/dynamo/blob/main/docs/components/router/README.md`。该文档说明 KV Router 通过 KV cache overlap、prefill/decode cost 进行路由，并提到 `nvext.agent_hints.priority` 与 router queue priority scheduling。
+- [R9] LMCache arXiv HTML：`https://arxiv.org/html/2510.09665`。该论文 Figure 8 对比 LMCache、basic vLLM、basic vLLM CPU offloading 和商业方案的 TTFT 与 throughput，并在摘要和评估部分总结最高 15x 吞吐量提升、至少 2x 延迟降低等结果。
 
 ### LMCache 代码出处
 
