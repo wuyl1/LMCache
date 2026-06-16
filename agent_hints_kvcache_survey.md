@@ -561,10 +561,19 @@ UMBP master 和 peer 的关系也可以简单理解：master 像“问路台”�
 Adapter 可以定义一个简单的 `SemanticKvHint`，描述一段 KV 的来源和生命周期。它不需要很复杂，核心字段类似：
 
 ```text
-tenant_id / agent_id / workflow_id / session_id
-phase = SYSTEM_PROMPT | USER_QUERY | TOOL_OUTPUT | RESPONSE | PARTIAL_PREFILL | UNKNOWN
-reuse_scope = GLOBAL | TENANT | AGENT | SESSION | REQUEST
-ttl_ms / priority / pin_until
+tenant_id     # 租户隔离维度，避免不同客户之间错误复用 KV
+agent_id      # Agent 类型或实例，用于区分不同业务 Agent
+workflow_id   # 工作流维度，例如 report-generation、code-review
+session_id    # 会话维度，用于多轮对话内复用
+
+phase         # 这段 KV 的语义阶段：
+              # SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / RESPONSE /
+              # PARTIAL_PREFILL / UNKNOWN
+
+reuse_scope   # 允许复用的范围：GLOBAL / TENANT / AGENT / SESSION / REQUEST
+ttl_ms        # 这段 KV 建议保留多久
+priority      # 驱逐或分层时的优先级提示
+pin_until     # 临时保护到某个时间点或事件完成，例如工具调用返回
 ```
 
 UMBP 不需要理解这些字段。Adapter 用它们生成 canonical key，例如：
@@ -591,7 +600,13 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 
 ### 7.4 接入 UMBP 的方式
 
-接入可以分两步，先轻后重。
+基本原理是先区分两件事：**知道 KV 在哪里** 和 **真正保存 KV bytes**。
+
+第一种情况，KV bytes 仍然放在 SGLang/vLLM 自己的 cache 里。UMBP 只保存一份 metadata，记录“某个 hash 的 KV 可能在哪个节点、哪个 tier 上”。这时 UMBP 的作用更像路由索引：下次类似请求进来时，可以把请求送到已有 KV 的节点，减少重复 prefill。
+
+第二种情况，KV bytes 直接交给 UMBP 管。UMBP 不只保存 metadata，还负责选择 peer、写入 HBM/DRAM/SSD、读取时从最快 tier 取回。这条路径收益更完整，但也需要 adapter 正确处理 page layout、dtype、model id、tokenizer id 和 KV layout version。
+
+因此接入可以分两步，先轻后重。
 
 **第一步：只上报 external KV metadata。**
 
@@ -615,7 +630,7 @@ KV bytes 仍在 SGLang/vLLM 自己的 cache 中，adapter 只把 hash、tier 和
 
 ### 7.5 一个具体例子
 
-假设一个企业报表 Agent 的请求结构是：
+假设一个企业报表 Agent 要分析“华东区 Q2 销售异常”。一次请求大致包含：
 
 ```text
 SYSTEM_PROMPT:  公司统一分析规范，约 3K tokens
@@ -625,16 +640,29 @@ PARTIAL_PREFILL: 等待 SQL 时已 prefill 的工具无关上下文
 RESPONSE:       最终中文报告
 ```
 
-UMBP Semantic KV Adapter 可以这样处理：
+这个流程可以按三层理解。
 
-- `SYSTEM_PROMPT` 以 `tenant_id + agent_id + model_id + token_hash` 生成 key，写入 UMBP-owned DRAM/HBM，并异步复制到 SSD。
-- `USER_QUERY` 只在 `session_id` 范围内保存，TTL 较短。
-- `TOOL_OUTPUT` 如果来自常用报表 SQL，可保存到 DRAM/SSD；如果是一次性大结果，则直接设置低优先级。
-- `PARTIAL_PREFILL` 在 SQL 执行期间 pin，工具结果回来后解除 pin。
-- `RESPONSE` 默认 skip-save，避免污染 HBM/DRAM。
-- 下一次同一 tenant 的报表 Agent 请求进来时，router 先通过 external KV match 找到已有系统提示词 KV 的节点，再由 UMBP `RouteGet` 从 HBM/DRAM 读取缺失 chunk；如果热层被驱逐但 SSD 还有副本，则从 SSD 回填。
+**第一层：Agent / 推理框架提供上下文。**
 
-这个例子的重点不是让 UMBP 理解“报表”或“SQL”的业务含义，而是让 adapter 把这些信息变成简单的缓存策略：系统提示词更值得保留，用户问题只在会话内短期保留，最终回答默认不保存。
+上游不需要懂 UMBP，只要保留请求结构即可：system message 是公司统一规范，user message 是本次问题，tool event 是 SQL 查询结果，metadata 里有 `tenant_id / agent_id / session_id / model_id`。这些信息本来就存在于 Agent runtime 或推理框架 adapter 中，区别只是以前没有传给 KV cache 策略使用。
+
+**第二层：Semantic KV Adapter 把上下文翻译成缓存决策。**
+
+Adapter 先按 token span 切分 KV，再给每段 KV 生成 hint 和 key：
+
+- `SYSTEM_PROMPT`：标为长期复用内容，用 `tenant_id + agent_id + model_id + token_hash + phase` 生成稳定 key；策略是优先保存，并优先放在 HBM/DRAM，SSD 作为兜底副本。
+- `USER_QUERY`：标为 session 内短期内容，key 包含 `session_id`；策略是短 TTL，只服务本轮或后续几轮对话。
+- `TOOL_OUTPUT`：标为工具结果，adapter 根据工具类型、结果大小和历史命中率决定是否保存；常用报表 SQL 的结果可以保存，一次性的大查询结果则降低优先级或跳过。
+- `PARTIAL_PREFILL`：标为临时保护内容，在 SQL 执行期间 pin，避免工具返回前被驱逐；工具结果回来并完成后续 prefill 后再降级。
+- `RESPONSE`：标为低复用价值内容，默认 skip-save，不调用 UMBP put/report。
+
+**第三层：UMBP 按 adapter 的决策执行。**
+
+如果先走 external KV metadata 路径，KV bytes 仍在 vLLM/SGLang 的 cache 里，adapter 只把系统提示词等前缀的 hash 和所在节点上报给 UMBP。下一次同一 tenant 的报表请求进来时，adapter 调 `match_external_kv()`，UMBP master 可以发现“某个 peer/worker 已经有这段系统提示词 KV”，router 就优先把请求送到那个节点，减少重复 prefill。
+
+如果后续把高价值 KV 交给 UMBP-owned KV，adapter 会对 `SYSTEM_PROMPT` 或高命中 `TOOL_OUTPUT` 调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择合适 peer，peer 真正分配 HBM/DRAM/SSD 空间并保存 KV bytes。读取时，adapter 对缺失 chunk 调 `batch_get_into_ptr()`；UMBP 通过 `RouteGet` 选择最快 tier，优先从 HBM/DRAM 返回，如果热层没有但 SSD 有副本，再从 SSD 回填。
+
+这个例子的重点不是让 UMBP 理解“报表”或“SQL”的业务含义，而是让 adapter 把这些业务上下文变成简单、可执行的缓存策略：系统提示词稳定复用，所以尽量保留；用户问题只在会话内短期保留；工具结果要看是否常用；最终回答默认不保存。
 
 这样得到的系统形态可以概括为：Sutradhara 负责“知道什么重要”，LMCache 思路负责“把 tags 变成 cache identity 和生命周期”，UMBP 负责“把 KV bytes 放在合适的节点和 tier，并高速搬运”。
 
