@@ -4,7 +4,7 @@
 
 本文分两类来源：
 
-- **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制主要参考用户提供的调研报告 `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md` 中第 2.1、2.2、3、4 节及其参考文献。本文不声称已在 Sutradhara 或 Dynamo 源码中逐行核验，只基于该报告做归纳。[R1][R2][R3]
+- **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制参考用户提供的调研报告 `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`，并补充核对了公开网络资料：Sutradhara arXiv HTML、Microsoft Research 发布页、NVIDIA Dynamo 官方 Agents 文档、NeMo Agent Toolkit 的 Dynamo LLM provider 源码/文档，以及 Dynamo Router README。[R1][R2][R3][R4][R5][R6][R7][R8]
 - **LMCache 当前实现**：LMCache 相关结论基于当前仓库代码核对，包括 vLLM adapter、cache key、token database、cache engine、multiprocess connector、storage backend 和配置文件。[C1][C2][C3][C4][C5][C6][C7][C8]
 
 因此，本文中“LMCache 当前没有原生 `agent_hints`”指的是：在当前仓库中未发现 Dynamo 风格 `nvext.agent_hints`、Sutradhara 风格语义标签 API，或基于 `SYSTEM_PROMPT / RESPONSE / TOOL_OUTPUT` 的原生语义驱逐策略。
@@ -29,7 +29,17 @@ Sutradhara、LMCache、NVIDIA Dynamo 都用于提升 Agent 工作流中的 KV Ca
 
 ### 2.1 实现方式
 
-Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结构。根据调研报告，它通过类似 `tag_kv_blocks()` 的 API 给 KV cache block 附加语义标签，并定义了几类语义标签：[R1]
+Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结构。根据论文 HTML 和 Microsoft Research 发布页，它通过一组 thin API 把编排器信息传给引擎，覆盖工具感知 prompt splitting、流式工具调度和语义提示驱动的缓存管理。[R1][R4][R5]
+
+论文列出的核心 API 包括：
+
+- `submit_partial_prefill()`：提交工具无关的 prompt slice，使引擎可在工具执行期间提前 prefill。
+- `extend_prefill()`：工具输出返回后，把工具相关后缀拼接到已固定的 partial prefill context。
+- `register_streaming_callback()`：逐 token 接收 decode 输出，便于工具调用 JSON 一完成就被派发。
+- `tag_kv_blocks()`：给 KV block 附加语义 hint，例如 `system_prompt`、`response`。
+- `set_reuse_priority()`：给 KV block 设置复用/固定优先级。[R4]
+
+在语义缓存管理上，它定义了几类标签：
 
 - `SYSTEM_PROMPT`
 - `USER_QUERY`
@@ -37,7 +47,7 @@ Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结
 - `RESPONSE`
 - `PARTIAL_PREFILL`
 
-这些标签不是简单 metadata，而是会被引擎用于缓存管理决策，例如驱逐优先级、复用优先级和 partial prefill 生命周期。[R1]
+这些标签不是简单 metadata，而是会被引擎用于缓存管理决策，例如驱逐优先级、复用优先级和 partial prefill 生命周期。[R1][R4]
 
 ### 2.2 示例
 
@@ -66,7 +76,7 @@ Sutradhara 可以标记为：
 - `RESPONSE`：通常一次性内容，优先驱逐。
 - `PARTIAL_PREFILL`：工具执行期间临时强保护。
 
-这里的优先级关系来自报告中对 Sutradhara 五类语义标记的描述：系统提示词高复用、最终响应低复用、partial prefill 在扩展完成前应被保护。[R1]
+这里的优先级关系来自报告和 Sutradhara 论文中的优先级驱逐描述：当容量不足时，引擎先驱逐低优先级 block；同一优先级层内再用 LRU 作为 tie-breaker。论文给出的驱逐顺序是 `RESPONSE -> TOOL_OUTPUT -> USER_QUERY -> SYSTEM_PROMPT -> PARTIAL_PREFILL`，即越靠后越晚驱逐。[R1][R4]
 
 ### 2.3 优点
 
@@ -74,6 +84,7 @@ Sutradhara 可以标记为：
 - 能做语义感知驱逐。
 - 能支持 partial prefill 与工具执行重叠。
 - 对多轮工具调用 Agent 很有针对性。
+- Microsoft Research 发布页还总结了其动机：工具调用占 FTR 延迟的显著比例、跨迭代存在上下文复用但 KV 命中率下降、顺序编排浪费请求内并行机会；Sutradhara 通过 co-design 缓解这些问题。[R5]
 
 ### 2.4 缺点
 
@@ -284,7 +295,9 @@ LMCache adapter 会读取这个字段，从而跳过保存。
 
 ### 4.1 实现方式
 
-Dynamo 的重点是请求级路由提示。它通过 OpenAI 兼容请求体扩展字段传递：
+Dynamo 的重点是请求级路由提示。NVIDIA Dynamo 官方 Agents 文档说明，agent-facing metadata 位于 OpenAI-compatible request body 的 `nvext` 下，包括 `agent_context` 和 `agent_hints`；Dynamo 使用这些元数据做 telemetry、routing hints 和 backend-specific cache behavior。[R6]
+
+它通过请求体扩展字段传递：
 
 ```text
 nvext.agent_hints
@@ -299,7 +312,7 @@ nvext.agent_hints
 - `latency_sensitivity`
 - `priority`
 
-这些字段来自用户提供报告中 Dynamo `nvext.agent_hints` 字段设计小节。[R2]
+这些字段来自用户提供报告、NVIDIA Dynamo Agents 文档和 NeMo Agent Toolkit 的 Dynamo LLM provider/GitHub 示例。[R2][R6][R7][R8]
 
 ### 4.2 字段含义
 
@@ -308,7 +321,9 @@ nvext.agent_hints
 - `osl`：预测输出长度。
 - `iat`：预测请求到达间隔。
 - `latency_sensitivity`：延迟敏感度。
-- `priority`：调度优先级。
+- `priority`：调度优先级。Dynamo 官方 Agents 文档说明 `priority` 可用于 engine queue ordering 和 KV cache eviction；NeMo Agent Toolkit 中通常按 `max_sensitivity - latency_sensitivity` 计算，数值越低优先级越高。[R6][R7]
+
+需要注意的是，Dynamo 官方 Agents 文档当前还列出一些更偏 serving/runtime 的字段，例如 `speculative_prefill`，并标注 `program_id`、`context_type` 为 planned；这说明 Dynamo 的 Agent Hints 正在向更丰富的 agentic serving metadata 扩展，但 `context_type` 这类语义类型在文档中仍是 planned，而不是本文所说 Sutradhara 式已落地的 token span 级语义标签。[R6]
 
 ### 4.3 示例
 
@@ -340,7 +355,7 @@ nvext.agent_hints
 - 降低 TTFT。
 - 在多 Worker 场景中提升吞吐。
 
-该路由逻辑描述来自报告对 Dynamo KV Router、`prefix_id`、请求优先级和缓存亲和路由的总结。[R2][R3]
+该路由逻辑描述来自报告对 Dynamo KV Router、`prefix_id`、请求优先级和缓存亲和路由的总结，也可由 Dynamo Router README 佐证：KV Router 会评估 worker 的 prefill/decode 成本并利用 KV cache overlap 减少重复计算；`--router-queue-threshold` 等配置还会启用通过 `nvext.agent_hints.priority` 的优先级调度。[R2][R3][R8]
 
 ### 4.4 优点
 
@@ -373,6 +388,82 @@ nvext.agent_hints
 | 工程耦合 | 高 | 低 | 中 |
 | 主要优势 | 语义表达强，优化潜力大 | 兼容性强，KV 管理能力完整 | 分布式路由效果强 |
 | 主要局限 | 改造引擎成本高 | 不原生理解 Agent 语义 | 不做细粒度语义 KV 管理 |
+
+### 5.1 性能收益对比图
+
+> 注意：以下图表来自不同论文、报告或官方材料中的实验结果，硬件、模型、负载、baseline 和指标定义并不完全一致。因此这些图适合说明“各类机制可能带来的收益方向和量级”，不适合作为严格的横向 benchmark。
+
+#### 5.1.1 Sutradhara：同负载下延迟降低与负载提升
+
+Sutradhara 的公开资料和报告显示，它通过工具执行与 prefill 重叠、流式工具调度、语义提示驱动的 KV cache 管理，在 vLLM/A100 相关实验中降低 FTR 和端到端延迟；报告还提到在相同中位数 FTR 延迟下可支持更高负载。[R1][R5]
+
+```mermaid
+xychart-beta
+    title "Sutradhara 性能收益（百分比）"
+    x-axis ["Median FTR 延迟降低", "端到端延迟降低", "相同 FTR 下负载提升"]
+    y-axis "百分比（%）" 0 --> 80
+    bar [15, 10, 77]
+```
+
+说明：
+
+- `Median FTR 延迟降低 15%` 和 `端到端延迟降低约 10%` 来自 Microsoft Research 发布页。[R5]
+- `相同中位数 FTR 延迟下负载提升 77%` 来自用户提供报告中对 Sutradhara 实验结果的整理。[R1]
+- 这些收益主要来自 co-design：`submit_partial_prefill()` 提前计算工具无关前缀，`extend_prefill()` 在工具结果返回后扩展，`tag_kv_blocks()` / `set_reuse_priority()` 指导 KV cache 管理。[R4]
+
+#### 5.1.2 Dynamo KV Router：相对轮询路由的加速比
+
+报告中整理的 Dynamo KV Router 结果显示，在 Mooncake Tool Agent Traces 类场景下，KV-aware routing 相比轮询路由显著降低 TTFT 和端到端延迟。[R2]
+
+```mermaid
+xychart-beta
+    title "Dynamo KV Router 相对轮询路由的加速比"
+    x-axis ["TTFT 平均值", "TTFT P99", "E2E 平均值", "E2E P99"]
+    y-axis "加速比（x）" 0 --> 22
+    bar [20.4, 15.9, 4.3, 3.8]
+```
+
+说明：
+
+- `TTFT 平均值约 20.4x`、`TTFT P99 约 15.9x`、`E2E 平均值约 4.3x`、`E2E P99 约 3.8x` 来自用户提供报告中对 Dynamo KV Router benchmark 的整理。[R2]
+- Dynamo Router README 说明 KV Router 会利用 KV cache overlap 和 worker 的 prefill/decode cost 做路由，减少重复 prefill；这解释了为什么长系统提示词、Agent 多轮前缀复用场景下收益明显。[R8]
+- Dynamo 的 `nvext.agent_hints` 和 `nvext.cache_control` 可进一步传递请求优先级、输出长度估计、prefix/session 相关信息，辅助路由和缓存生命周期控制。[R6][R7]
+
+#### 5.1.3 LMCache：报告中的系统级收益与当前文档解释边界
+
+用户提供报告将 LMCache 描述为外置 KV Cache 管理层，并整理了 LMCache 在本地前缀缓存、分布式前缀复用、PD 分离等设置中的系统级收益：最高 15x 吞吐量提升、至少 2x 延迟降低。[R3]
+
+```mermaid
+xychart-beta
+    title "LMCache 报告中整理的系统级收益"
+    x-axis ["吞吐量提升", "延迟降低"]
+    y-axis "倍数（x）" 0 --> 16
+    bar [15, 2]
+```
+
+说明：
+
+- 这里展示的是报告中对 LMCache 论文/资料的概括性结果，不是本文在本地仓库重新复现实验的结果。[R3]
+- 结合当前代码看，LMCache 的性能收益主要来自外置 KV 管理：`lookup` 发现前缀命中，`pin` 防止 retrieve 前淘汰，`retrieve` 把 KV 加载回引擎，`move/clear/compress` 支持缓存迁移、清理和存储优化。[C3][C4][C5]
+- 这些收益不依赖 LMCache 原生理解 `SYSTEM_PROMPT`。LMCache 当前复用的是精确 token 前缀；系统提示词能受益，是因为它通常稳定地位于 prompt 前缀。[C2][C3]
+
+#### 5.1.4 三类机制的收益来源对比
+
+```mermaid
+flowchart LR
+    A[Sutradhara<br/>语义标记 + partial prefill] --> A1[减少工具等待与重复 prefill]
+    A --> A2[高价值 KV 最后驱逐]
+    B[Dynamo<br/>nvext.agent_hints + KV Router] --> B1[相关请求路由到有 KV 的 Worker]
+    B --> B2[结合优先级与负载做调度]
+    C[LMCache<br/>外置 KV Cache 管理] --> C1[跨请求保存与加载 KV]
+    C --> C2[分层存储、pin、move、compress]
+```
+
+| 系统 | 主要性能收益来源 | 适合场景 | 注意事项 |
+|---|---|---|---|
+| Sutradhara | 语义标记驱动的优先级驱逐；partial prefill 与工具执行重叠 | 多轮工具调用、prompt 结构明确的 Agent | 需要引擎和编排器协同改造 |
+| Dynamo | KV-aware routing；`prefix_id` / `priority` / `osl` 等请求级 hints | 多 Worker、多节点、分布式推理服务 | 主要优化路由层，不是 token span 语义标签 |
+| LMCache | 外置 KV lookup/retrieve/store；pin；分层存储与迁移压缩 | 需要跨请求、跨层、跨 backend 管理 KV 的生产系统 | 当前不原生理解 `SYSTEM_PROMPT` / `RESPONSE` 语义 |
 
 ---
 
@@ -436,6 +527,11 @@ Sutradhara、LMCache、Dynamo 代表了 Agent Hints 在 KV Cache 系统中的三
 - [R1] `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`：第 2.1 节 “Sutradhara：Orchestrator-Engine Co-design 与语义标记”；第 3.1、3.4 节对语义标记和复用优先级的总结。报告引用 Biswas et al., “Sutradhara: An Intelligent Orchestrator-Engine Co-design for Tool-based Agentic Inference.”
 - [R2] `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`：第 2.2 节 “NVIDIA Dynamo：Agent Hints 与 KV 感知路由”；第 3.2、3.3 节对路由提示和生命周期控制的总结。
 - [R3] `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`：第 4.1 节 “Co-design vs. Layered Architecture”；第 4.2 节对 LMCache 作为引擎无关连接器方案的总结。
+- [R4] Sutradhara arXiv HTML：`https://arxiv.org/html/2601.12967`。该页面列出 `submit_partial_prefill()`、`extend_prefill()`、`register_streaming_callback()`、`tag_kv_blocks()`、`set_reuse_priority()` 等 API，并描述 partial prefill、语义 KV block tagging 和 priority-based eviction。
+- [R5] Microsoft Research 发布页：`https://www.microsoft.com/en-us/research/publication/sutradhara-an-intelligent-orchestrator-engine-co-design-for-tool-based-agentic-inference/`。该页总结了 Sutradhara 的 co-design 动机、三类优化，以及在 vLLM/A100 上降低 FTR 和端到端延迟的结果。
+- [R6] NVIDIA Dynamo 官方 Agents 文档：`https://docs.dynamo.nvidia.com/dynamo/user-guides/agents`。该页说明 agent-facing request metadata 位于 `nvext`，`agent_hints` 可携带 priority、expected output length、speculative prefill 等 serving-relevant intent，并提到 priority、osl、planned `context_type` 等字段。
+- [R7] NVIDIA NeMo Agent Toolkit Dynamo LLM provider 源码/文档：`https://github.com/NVIDIA/NeMo-Agent-Toolkit/blob/develop/packages/nvidia_nat_core/src/nat/llm/dynamo_llm.py` 与 `https://docs.nvidia.com/nemo/agent-toolkit/latest/api/nat/llm/dynamo_llm/index.html`。该实现说明所有 routing hints 注入到 `nvext.agent_hints`，标准字段包括 `latency_sensitivity`、`osl`、`priority`，自定义字段包括 `prefix_id`、`total_requests`、`iat`，并注入 `nvext.cache_control`。
+- [R8] Dynamo Router README：`https://github.com/ai-dynamo/dynamo/blob/main/docs/components/router/README.md`。该文档说明 KV Router 通过 KV cache overlap、prefill/decode cost 进行路由，并提到 `nvext.agent_hints.priority` 与 router queue priority scheduling。
 
 ### LMCache 代码出处
 
