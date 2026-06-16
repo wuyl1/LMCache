@@ -521,16 +521,33 @@ UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD
 ```text
 Agent Orchestrator / SGLang / vLLM
         │
-        │  messages / tool events / RAG context / session metadata
+        │  例：企业报表 Agent 请求
+        │      - system message: "公司统一分析规范"
+        │      - user message:   "分析华东区 Q2 销售异常"
+        │      - tool event:     SQL 查询结果
+        │      - metadata:       tenant_id / agent_id / session_id
         ▼
 UMBP Semantic KV Adapter
         │
-        │  生成 hint / key / routing policy / tier policy
+        │  例：把上游信息翻译成缓存策略
+        │      - system message -> phase=SYSTEM_PROMPT，长期保存
+        │      - SQL result     -> phase=TOOL_OUTPUT，按大小和命中率保存
+        │      - final answer   -> phase=RESPONSE，默认 skip-save
+        │      - cache key      -> hash(model_id, token_hash, tenant_id, phase, ...)
         ▼
 MORI-UMBP
         │
-        │  opaque key + RouteGet/RoutePut + HBM/DRAM/SSD
+        │  例：按 adapter 给出的 key 和策略执行
+        │      - 路由优化: SYSTEM_PROMPT 先用 match_external_kv() 找已有前缀 KV 的节点
+        │      - 写入优化: SYSTEM_PROMPT/高命中 TOOL_OUTPUT 用 RoutePut 选 peer，再 batch_put_from_ptr() 写入
+        │      - 读取优化: UMBP-owned KV 命中时，用 RouteGet 选最快 tier，再 batch_get_into_ptr() 取回
+        │      - 跳过保存: RESPONSE 由 adapter 直接 skip-save，UMBP 不写入
+        │      - tier policy: SYSTEM_PROMPT 优先 HBM/DRAM，必要时落 SSD
 ```
+
+这个例子的重点是：UMBP 不需要知道这是报表任务或 SQL 结果。业务含义由 adapter 转成 key、API 调用和 tier policy 后，UMBP 只负责按这些输入做路由、读写和分层存储。其中 `match_external_kv()` 主要用于“把请求送到已有 KV 的节点”，不直接搬运 KV bytes；真正把 KV bytes 存进或取出 UMBP，走的是 `RoutePut` / `RouteGet` 加 `batch_put_from_ptr()` / `batch_get_into_ptr()`。
+
+语义带来的优化主要体现在三处。第一，`SYSTEM_PROMPT` 复用价值高，adapter 会生成稳定 key，并让 UMBP 优先匹配已有 KV，命中后可以少做 prefill。第二，`TOOL_OUTPUT` 可能很大，adapter 可以根据工具类型、大小和历史命中率决定是否保存，避免一次性大结果挤掉更常用的系统提示词。第三，`RESPONSE` 通常不会被再次用作前缀，adapter 可以直接 skip-save，减少无效写入和 cache 污染。UMBP 执行这些优化时并不理解语义，只是根据 adapter 给出的 key、tier 和保存/跳过决策完成底层操作。
 
 这里有两个边界需要保持清楚：
 
