@@ -508,7 +508,7 @@ RESPONSE           优先驱逐
 
 ---
 
-## 7. 面向 UMBP 的 Semantic KV Cache 管理系统设计
+## 7. RFC：面向 UMBP 的 Semantic KV Cache 管理方案
 
 前面几节分别讨论了语义提示、外置 KV 管理和分布式路由。把这些思路落到 MORI-UMBP 时，最重要的是先划清边界：**不要把 Agent 语义逻辑放进 UMBP core**。
 
@@ -587,7 +587,19 @@ cache_key = hash(
 
 这个 key 不能只包含 token hash。否则不同租户共享相同系统提示词时，可能发生不期望的跨域复用。如果 `reuse_scope = GLOBAL`，可以有意去掉 `tenant_id`，但这必须是显式授权，而不是默认行为。
 
-### 7.3 如何使用 UMBP 现有能力
+### 7.3 如果上游不产生语义怎么办
+
+现实里，很多 Agent Orchestrator、SGLang 或 vLLM 集成不会直接输出 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`PARTIAL_PREFILL` 这样的语义 hint。这时不要让 UMBP core 去猜 prompt 含义，而应让 adapter 退化为“弱语义”模式。
+
+弱语义模式可以从三类信息推导 hints：
+
+- **请求结构**：Chat API 里的 `role=system/user/assistant/tool`、tool call event、RAG context 拼接位置，通常足够区分系统提示词、用户问题和工具结果。
+- **框架 metadata**：tenant、session、request id、model id、tokenizer id、KV layout version 等字段，可用于生成隔离 key，即使没有语义 phase 也能避免错误复用。
+- **保守默认策略**：无法判断语义时，把 phase 标为 `UNKNOWN`，只做短 TTL、session scope 或 external KV routing，不做高优先级 pin 和跨租户复用。
+
+因此，没有显式 hint 并不意味着方案不可用，只是收益会分层：第一阶段仍能获得 cache key 隔离和 KV-aware routing；只有当上游或 adapter 能稳定识别 system prompt、tool output、partial prefill 时，才能进一步获得语义分层、语义驱逐和 partial prefill pin 的收益。
+
+### 7.4 如何使用 UMBP 现有能力
 
 Adapter 使用 UMBP 时，可以先分成两条路径。
 
@@ -625,7 +637,7 @@ eviction_score =
 
 实现上不应让 master 直接管理每个 token span 的复杂状态。更合适的是由 adapter/peer 提供轻量 metadata summary，例如 `phase`、`priority`、`ttl`、`reuse_scope`；master 只保存驱逐和路由需要的字段。peer 仍然是最终 owner。
 
-### 7.4 UMBP 能承接什么，不能承接什么
+### 7.5 UMBP 能承接什么，不能承接什么
 
 UMBP 已经具备很多底层能力，但 LMCache 的高层语义不能直接等同于 UMBP 现有功能：
 
@@ -641,7 +653,7 @@ UMBP 已经具备很多底层能力，但 LMCache 的高层语义不能直接等
 
 因此，更准确的说法是：UMBP 可以承接 LMCache 思路中的“分层存储、外部 KV 读写、路由索引和缓存隔离”；`cache_salt`、tag、skip-save、semantic policy 等高层语义应放在 adapter 中实现。
 
-### 7.5 建议分阶段落地
+### 7.6 建议分阶段落地
 
 **阶段 1：只做语义 key 和 external KV routing。**
 
@@ -661,7 +673,7 @@ UMBP 已经具备很多底层能力，但 LMCache 的高层语义不能直接等
 
 当 Agent 发起工具调用时，adapter 把工具无关前缀标为 `PARTIAL_PREFILL` 并 pin；工具结果返回并完成 `extend_prefill` 后，把它降级为 `TOOL_OUTPUT` 或 `USER_QUERY`。这一步最接近 Sutradhara，但需要推理引擎 scheduler 配合，不能只靠 UMBP 完成。
 
-### 7.6 风险与边界
+### 7.7 风险与边界
 
 - **UMBP 不应负责解析 prompt。** 语义识别应由 Agent orchestrator 或推理框架 adapter 完成。
 - **Semantic KV Adapter 是可选增强层，不是 UMBP core 的一部分。** 没有 hint producer 时，UMBP 仍然按 opaque key 做普通 KV block pool；它不会自动获得语义感知路由、语义分层或语义驱逐收益。
@@ -671,7 +683,7 @@ UMBP 已经具备很多底层能力，但 LMCache 的高层语义不能直接等
 - **partial prefill 不是纯 cache 功能。** 它需要引擎能提前 prefill、暂停、扩展上下文；UMBP 只能提供 KV 存储、pin 和跨节点搬运。
 - **SSD 适合兜底，不适合热路径默认读取。** UMBP 当前 `RouteGet` 已按 HBM > DRAM > SSD 选择 tier，语义策略应顺着这个模型，而不是让高频请求频繁走 SSD。
 
-### 7.7 一个具体例子
+### 7.8 一个具体例子
 
 假设一个企业报表 Agent 的请求结构是：
 
