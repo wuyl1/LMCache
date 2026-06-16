@@ -7,8 +7,6 @@
 - **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制参考用户提供的调研报告 `report.md`，并补充核对了公开资料：Sutradhara arXiv HTML、Microsoft Research 发布页、NVIDIA Dynamo 官方 Agents 文档、NeMo Agent Toolkit 的 Dynamo LLM provider 源码/文档、Dynamo Router README，以及 LMCache arXiv HTML。[R1][R2][R3][R4][R5][R6][R7][R8][R9]
 - **LMCache 当前实现**：LMCache 相关判断来自当前仓库代码，包括 vLLM adapter、cache key、token database、cache engine、multiprocess connector、storage backend 和配置文件。[C1][C2][C3][C4][C5][C6][C7][C8]
 
-因此，文中说“LMCache 当前没有原生 `agent_hints`”时，含义很具体：当前仓库没有 Dynamo 风格的 `nvext.agent_hints`，也没有 Sutradhara 风格的语义标签 API，或基于 `SYSTEM_PROMPT / RESPONSE / TOOL_OUTPUT` 的原生语义驱逐策略。
-
 ---
 
 ## 1. 核心结论
@@ -485,12 +483,14 @@ RESPONSE           优先驱逐
 
 ### 7.1 设计目标
 
-这个系统的目标可以拆成四层：
+这里的“四层”不是四个独立服务，而是四类职责。它们和框架组件的关系如下：
 
-1. **语义层**：吸收 Sutradhara 的 `SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / RESPONSE / PARTIAL_PREFILL` 思路，让系统知道不同 KV block 的复用价值。
-2. **分层层**：复用 UMBP 的 HBM、DRAM、SSD 以及 peer-to-peer 读取能力，把高价值 KV 尽量留在近端高性能 tier，把低价值或冷数据降到 SSD 或直接不保存。
-3. **路由层**：复用 UMBP master 的 advisor 模型和 external KV index，让请求优先路由到已经持有相关 KV block 的节点。
-4. **隔离层**：借鉴 LMCache 的 `lmcache.tag.*` 思路，把 tenant、agent、workflow、session、phase 放入逻辑 cache identity，避免跨租户或跨任务错误复用。
+| 职责层 | 主要落点 | 做什么 |
+|---|---|---|
+| **语义层** | Agent Orchestrator / SGLang / vLLM adapter | 识别 prompt 结构，产生 `SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / RESPONSE / PARTIAL_PREFILL` 等语义 hints。 |
+| **隔离层** | UMBP Semantic KV Adapter | 生成带 `tenant_id / agent_id / workflow_id / session_id / phase` 的 cache key，避免跨租户或跨任务错误复用。 |
+| **分层层** | UMBP Semantic KV Adapter + MORI-UMBP | 把语义 hint 转成 HBM/DRAM/SSD tier policy：高价值 KV 留在近端高性能 tier，低价值或冷数据下沉到 SSD 或直接不保存。 |
+| **路由层** | UMBP Semantic KV Adapter + UMBP master | 复用 master-as-advisor、`GlobalBlockIndex`、`ExternalKvBlockIndex`、`RouteGet` 等能力，让请求优先命中已有 KV 的节点。 |
 
 也就是说，UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector 或 UMBP adapter 中。当前 UMBP repo 内没有 prompt、tool call、agent session 等一等公民对象，因此不要假设 UMBP 能直接产生 Sutradhara 式语义标签。
 
@@ -499,22 +499,27 @@ RESPONSE           优先驱逐
 ```text
 Agent Orchestrator / SGLang / vLLM
         │
+        ├─ 语义层：识别 prompt span，生成 SemanticKvHint
+        │
         │  Semantic KV Hints
         ▼
 UMBP Semantic KV Adapter
         │
-        ├─ 生成 canonical cache key
+        ├─ 隔离层：生成 canonical cache key
         ├─ 按 token span 切分 page / chunk
-        ├─ 把 semantic class 转成 tier policy / eviction priority
+        ├─ 分层层：把 semantic class 转成 tier policy / eviction priority
+        ├─ 路由层：查询 external KV / RouteGet，选择已有 KV 的节点
         ├─ 调用 UMBPClient put/get 或 external KV APIs
         ▼
 MORI-UMBP
         │
-        ├─ MasterServer: RouteGet / RoutePut / ExternalKvBlockIndex
-        ├─ PeerServiceServer: AllocateSlot / ResolveKey / EvictKey / PrepareSsdRead
-        ├─ PeerDramAllocator: HBM/DRAM canonical owner
-        └─ PeerSsdManager: SSD cold tier and local LRU
+        ├─ 路由层：MasterServer, RouteGet / RoutePut, GlobalBlockIndex, ExternalKvBlockIndex
+        ├─ 分层层：PeerServiceServer, AllocateSlot / ResolveKey / PrepareSsdRead
+        ├─ 分层层：PeerDramAllocator, HBM/DRAM canonical owner
+        └─ 分层层：PeerSsdManager, SSD cold tier and local LRU
 ```
+
+因此，四层和三块组件不是一一对应关系。Agent/推理框架主要负责语义层；adapter 是核心翻译层，承担隔离、分层策略和路由策略；MORI-UMBP 执行真正的分层存储、跨节点查找和 KV 搬运。
 
 这套架构最重要的约束，是不要让 UMBP master 变成强一致 metadata 数据库。Mori 当前设计明确是 master-as-advisor：master 不拥有 page 状态，peer 才是 KV block 的真实 owner，master 只通过 heartbeat 投影 `GlobalBlockIndex`。[M2] 语义扩展也应保持这个方向：master 可以保存轻量 semantic summary 用于路由和驱逐排序，但不能把每次 token span 更新变成同步 master 写路径。
 
