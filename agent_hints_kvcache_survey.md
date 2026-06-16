@@ -1,23 +1,23 @@
 # Agent Hints 与 KV Cache 系统调研：Sutradhara、LMCache、Dynamo 对比
 
-## 0. 资料来源与校验范围
+## 0. 阅读范围与判断口径
 
-本文分两类来源：
+本文使用两类资料来避免把概念推断和代码事实混在一起：
 
-- **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制参考用户提供的调研报告 `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`，并补充核对了公开网络资料：Sutradhara arXiv HTML、Microsoft Research 发布页、NVIDIA Dynamo 官方 Agents 文档、NeMo Agent Toolkit 的 Dynamo LLM provider 源码/文档、Dynamo Router README，以及 LMCache arXiv HTML。[R1][R2][R3][R4][R5][R6][R7][R8][R9]
-- **LMCache 当前实现**：LMCache 相关结论基于当前仓库代码核对，包括 vLLM adapter、cache key、token database、cache engine、multiprocess connector、storage backend 和配置文件。[C1][C2][C3][C4][C5][C6][C7][C8]
+- **外部系统资料**：Sutradhara、NVIDIA Dynamo 的机制参考用户提供的调研报告 `report.md`，并补充核对了公开资料：Sutradhara arXiv HTML、Microsoft Research 发布页、NVIDIA Dynamo 官方 Agents 文档、NeMo Agent Toolkit 的 Dynamo LLM provider 源码/文档、Dynamo Router README，以及 LMCache arXiv HTML。[R1][R2][R3][R4][R5][R6][R7][R8][R9]
+- **LMCache 当前实现**：LMCache 相关判断来自当前仓库代码，包括 vLLM adapter、cache key、token database、cache engine、multiprocess connector、storage backend 和配置文件。[C1][C2][C3][C4][C5][C6][C7][C8]
 
-因此，本文中“LMCache 当前没有原生 `agent_hints`”指的是：在当前仓库中未发现 Dynamo 风格 `nvext.agent_hints`、Sutradhara 风格语义标签 API，或基于 `SYSTEM_PROMPT / RESPONSE / TOOL_OUTPUT` 的原生语义驱逐策略。
+因此，文中说“LMCache 当前没有原生 `agent_hints`”时，含义很具体：当前仓库没有 Dynamo 风格的 `nvext.agent_hints`，也没有 Sutradhara 风格的语义标签 API，或基于 `SYSTEM_PROMPT / RESPONSE / TOOL_OUTPUT` 的原生语义驱逐策略。
 
 ---
 
 ## 1. 核心结论
 
-Sutradhara、LMCache、NVIDIA Dynamo 都用于提升 Agent 工作流中的 KV Cache 复用效率，但它们的实现层次不同。
+Sutradhara、LMCache、NVIDIA Dynamo 都在解决 Agent 工作流里的 KV Cache 复用问题，但切入层次不同。
 
-- **Sutradhara**：语义标记进入推理引擎内部，让引擎知道哪些 KV 是系统提示词、工具输出、最终响应或 partial prefill。[R1]
-- **LMCache**：当前没有原生 `agent_hints`，它是外置 KV Cache 管理层，通过 `lookup`、`pin`、`store/retrieve`、`move`、`clear`、`compress` 等机制管理 KV。[C3][C4]
-- **Dynamo**：通过请求级 `nvext.agent_hints` 做 KV 感知路由，让相关请求更容易被路由到已有 KV 前缀的 Worker。[R2]
+- **Sutradhara** 把语义标记送进推理引擎内部，让引擎知道哪些 KV 来自系统提示词、工具输出、最终响应或 partial prefill。[R1]
+- **LMCache** 当前没有原生 `agent_hints`，它更像外置 KV Cache 管理层，通过 `lookup`、`pin`、`store/retrieve`、`move`、`clear`、`compress` 等机制管理 KV 生命周期。[C3][C4]
+- **Dynamo** 通过请求级 `nvext.agent_hints` 做 KV 感知路由，让相关请求更容易被路由到已有 KV 前缀的 Worker。[R2]
 
 一句话概括：
 
@@ -29,7 +29,7 @@ Sutradhara、LMCache、NVIDIA Dynamo 都用于提升 Agent 工作流中的 KV Ca
 
 ### 2.1 实现方式
 
-Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结构。根据论文 HTML 和 Microsoft Research 发布页，它通过一组 thin API 把编排器信息传给引擎，覆盖工具感知 prompt splitting、流式工具调度和语义提示驱动的缓存管理。[R1][R4][R5]
+Sutradhara 的核心做法，是让 Agent 编排器把 prompt 的内部结构告诉推理引擎。根据论文 HTML 和 Microsoft Research 发布页，它通过一组 thin API 把编排器信息传给引擎，覆盖工具感知 prompt splitting、流式工具调度，以及语义提示驱动的缓存管理。[R1][R4][R5]
 
 论文列出的核心 API 包括：
 
@@ -39,7 +39,7 @@ Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结
 - `tag_kv_blocks()`：给 KV block 附加语义 hint，例如 `system_prompt`、`response`。
 - `set_reuse_priority()`：给 KV block 设置复用/固定优先级。[R4]
 
-在语义缓存管理上，它定义了几类标签：
+在语义缓存管理上，Sutradhara 使用几类标签描述 KV block 的来源：
 
 - `SYSTEM_PROMPT`
 - `USER_QUERY`
@@ -47,11 +47,11 @@ Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结
 - `RESPONSE`
 - `PARTIAL_PREFILL`
 
-这些标签不是简单 metadata，而是会被引擎用于缓存管理决策，例如驱逐优先级、复用优先级和 partial prefill 生命周期。[R1][R4]
+这些标签不是只用于记录日志的 metadata，而是会进入引擎的缓存管理决策，例如驱逐优先级、复用优先级和 partial prefill 生命周期。[R1][R4]
 
 ### 2.2 示例
 
-一个 Agent prompt 可能是：
+例如，一个 Agent prompt 可以拆成几段：
 
 ```text
 0-800     system prompt + tool schema
@@ -60,7 +60,7 @@ Sutradhara 的核心是让 Agent 编排器向推理引擎传递 prompt 内部结
 1300-1400 assistant response
 ```
 
-Sutradhara 可以标记为：
+Sutradhara 会把这些 token span 标成对应语义类型：
 
 ```text
 0-800     SYSTEM_PROMPT
@@ -69,14 +69,14 @@ Sutradhara 可以标记为：
 1300-1400 RESPONSE
 ```
 
-引擎可以据此做决策：
+引擎拿到这些标签后，就能区分不同 KV block 的复用价值：
 
 - `SYSTEM_PROMPT`：复用价值高，最后驱逐。
 - `TOOL_OUTPUT`：可能被后续轮次复用，中等优先级。
 - `RESPONSE`：通常一次性内容，优先驱逐。
 - `PARTIAL_PREFILL`：工具执行期间临时强保护。
 
-这里的优先级关系来自报告和 Sutradhara 论文中的优先级驱逐描述：当容量不足时，引擎先驱逐低优先级 block；同一优先级层内再用 LRU 作为 tie-breaker。论文给出的驱逐顺序是 `RESPONSE -> TOOL_OUTPUT -> USER_QUERY -> SYSTEM_PROMPT -> PARTIAL_PREFILL`，即越靠后越晚驱逐。[R1][R4]
+这里的优先级关系来自报告和 Sutradhara 论文中的描述：容量不足时，引擎先驱逐低优先级 block；同一优先级层内再用 LRU 作为 tie-breaker。论文给出的驱逐顺序是 `RESPONSE -> TOOL_OUTPUT -> USER_QUERY -> SYSTEM_PROMPT -> PARTIAL_PREFILL`，越靠后越晚驱逐。[R1][R4]
 
 ### 2.3 优点
 
@@ -99,7 +99,7 @@ Sutradhara 可以标记为：
 
 ### 3.1 当前是否有 Agent Hints
 
-当前 LMCache 没有原生 `agent_hints` 机制。这个判断来自对当前仓库的关键词和调用路径核对：LMCache 有 `request_configs`、`cache_salt`、`lmcache.tag.*`、`layout_hints` 等机制，但没有统一的 `agent_hints` 字段或 Sutradhara 风格语义标签 API。[C1][C2][C5]
+当前 LMCache 没有原生 `agent_hints` 机制。代码里可以看到 `request_configs`、`cache_salt`、`lmcache.tag.*`、`layout_hints` 等机制，但没有统一的 `agent_hints` 字段，也没有 Sutradhara 风格的语义标签 API。[C1][C2][C5]
 
 它没有：
 
@@ -108,7 +108,7 @@ Sutradhara 可以标记为：
 - 基于语义标签的驱逐优先级
 - token span 级语义 metadata
 
-LMCache 当前提供的是通用 KV Cache 管理能力：
+LMCache 当前提供的是更通用的 KV Cache 管理能力：
 
 - `lookup`
 - `store / retrieve`
@@ -121,17 +121,17 @@ LMCache 当前提供的是通用 KV Cache 管理能力：
 - `lmcache.skip_save`
 - 分层存储
 
-其中 `lookup`、`move`、`compress`、`decompress`、`clear` 位于 `LMCacheEngine`；`pin/unpin` 由 storage backend 和 lookup pin 路径实现；`cache_salt` 在 MP key 中作为缓存身份的一部分；`lmcache.tag.*` 在 `CacheEngineKey` 中进入 `tags`。[C2][C3][C4][C6]
+这些能力分布在不同模块中：`lookup`、`move`、`compress`、`decompress`、`clear` 位于 `LMCacheEngine`；`pin/unpin` 由 storage backend 和 lookup pin 路径实现；`cache_salt` 在 MP key 中作为缓存身份的一部分；`lmcache.tag.*` 在 `CacheEngineKey` 中进入 `tags`。[C2][C3][C4][C6]
 
 ### 3.2 LMCache 如何复用 Agent 前缀
 
-LMCache 的复用条件主要是：
+LMCache 的复用条件可以简化理解为：
 
 ```text
 token 前缀完全一致 + chunk 边界对齐
 ```
 
-它不理解某段 token 是 `SYSTEM_PROMPT`，但 system prompt 通常稳定地放在 prompt 前面，所以自然容易形成精确前缀命中。LMCache 的 token 处理路径按 chunk 生成 prefix hash，再构造 `CacheEngineKey`，lookup 返回连续前缀命中的 token 数。[C2][C3]
+它不理解某段 token 是 `SYSTEM_PROMPT`。但 system prompt 通常稳定地位于 prompt 前部，因此很容易自然形成精确前缀命中。LMCache 的 token 处理路径会按 chunk 生成 prefix hash，再构造 `CacheEngineKey`；`lookup` 返回的是连续前缀命中的 token 数。[C2][C3]
 
 ### 3.3 示例：长系统提示词复用
 
@@ -169,7 +169,7 @@ token 512-767 命中
 token 768-... 未命中
 ```
 
-于是 LMCache 返回前 `768 tokens` 可以从外部 KV cache 加载。
+于是 LMCache 返回：前 `768 tokens` 可以从外部 KV cache 加载。
 
 后续流程：
 
@@ -179,13 +179,13 @@ token 768-... 未命中
 4. `768` token 之后的新内容由 vLLM 正常 prefill。
 5. 请求完成后释放 pin，并可能保存新计算出的 chunk。
 
-这里 LMCache 复用的是“精确 token 前缀”，不是因为它知道这段是 `SYSTEM_PROMPT`。
+这个例子的关键点是：LMCache 复用的是“精确 token 前缀”，不是因为它知道这段内容是 `SYSTEM_PROMPT`。
 
 代码依据：`ChunkedTokenDatabase` 按 `chunk_size` 切分 token 并生成 prefix hash；`LMCacheEngine.lookup()` 对这些 key 做连续前缀命中检查；vLLM MP connector 根据 LMCache 命中 token 数和 vLLM 已计算 token 数决定需要 retrieve 的范围。[C2][C3][C5]
 
 ### 3.4 `lmcache.tag.*`
 
-`lmcache.tag.*` 是 LMCache 中比较接近 hint-like metadata 的机制。
+`lmcache.tag.*` 是 LMCache 中最接近 hint-like metadata 的机制，但它的作用边界要说清楚。
 
 在 vLLM v1 adapter 中，`kv_transfer_params` 中所有 `lmcache.` 前缀字段会被提取为 `request_configs`；随后 `CacheEngineKey` 只把 `lmcache.tag.*` 前缀字段抽取到 `tags`，并把 `tags` 纳入 key 的 hash/equality。[C1][C2]
 
@@ -199,7 +199,7 @@ token 768-... 未命中
 }
 ```
 
-这些 tag 会进入 cache key。
+这些 tag 会进入 cache key，成为缓存身份的一部分。
 
 例如同一段 token：
 
@@ -220,7 +220,7 @@ lmcache.tag.phase = system_prompt
 lmcache.tag.phase = tool_output
 ```
 
-虽然 token 完全一样，但 cache key 不同：
+即使 token 完全一样，cache key 也会不同：
 
 ```text
 hash(tokens) + phase=system_prompt
@@ -233,7 +233,7 @@ hash(tokens) + phase=tool_output
 - B 保存的 KV 只有同样带 `phase=tool_output` 的请求能命中。
 - A 和 B 不会互相复用。
 
-但 `lmcache.tag.phase=system_prompt` 不会让 LMCache 自动提高该缓存的保留优先级。它只是控制“能不能共享”，不是控制“谁更值得保留”。
+但 `lmcache.tag.phase=system_prompt` 不会让 LMCache 自动提高该缓存的保留优先级。它控制的是“能不能共享”，不是“谁更值得保留”。
 
 这是因为当前 `CacheEngineKey` 只把 tag 放入缓存身份；本仓库中未见 storage manager 或 eviction policy 对 `lmcache.tag.phase` 做语义优先级解释。[C2][C4]
 
@@ -261,15 +261,15 @@ tenant B: cache_salt = tenant-b
 
 ### 3.6 `lmcache.skip_save`
 
-如果某个 Agent 请求是一次性请求，不希望污染缓存，可以传：
+如果某个 Agent 请求是一次性请求，不希望污染缓存，可以传入：
 
 ```text
 lmcache.skip_save = True
 ```
 
-LMCache adapter 会读取这个字段，从而跳过保存。
+LMCache adapter 会读取这个字段，并在保存路径中跳过该请求。
 
-这可以粗粒度表达“低复用价值内容不缓存”，但它不是 token span 级语义标签。
+它可以粗粒度表达“低复用价值内容不缓存”，但不是 token span 级语义标签。
 
 代码依据：vLLM v1 adapter 在生成请求 metadata 时读取 `tracker.request_configs` 中的 `lmcache.skip_save`，并把它并入 `skip_save` 判断。[C1]
 
@@ -295,9 +295,9 @@ LMCache adapter 会读取这个字段，从而跳过保存。
 
 ### 4.1 实现方式
 
-Dynamo 的重点是请求级路由提示。NVIDIA Dynamo 官方 Agents 文档说明，agent-facing metadata 位于 OpenAI-compatible request body 的 `nvext` 下，包括 `agent_context` 和 `agent_hints`；Dynamo 使用这些元数据做 telemetry、routing hints 和 backend-specific cache behavior。[R6]
+Dynamo 的重点不是 token span 级语义标记，而是请求级路由提示。NVIDIA Dynamo 官方 Agents 文档说明，agent-facing metadata 位于 OpenAI-compatible request body 的 `nvext` 下，包括 `agent_context` 和 `agent_hints`；Dynamo 使用这些元数据做 telemetry、routing hints 和 backend-specific cache behavior。[R6]
 
-它通过请求体扩展字段传递：
+这些信息通过请求体扩展字段传递：
 
 ```text
 nvext.agent_hints
@@ -312,7 +312,7 @@ nvext.agent_hints
 - `latency_sensitivity`
 - `priority`
 
-这些字段来自用户提供报告、NVIDIA Dynamo Agents 文档和 NeMo Agent Toolkit 的 Dynamo LLM provider/GitHub 示例。[R2][R6][R7][R8]
+这些字段来自用户提供报告、NVIDIA Dynamo Agents 文档，以及 NeMo Agent Toolkit 的 Dynamo LLM provider/GitHub 示例。[R2][R6][R7][R8]
 
 ### 4.2 字段含义
 
@@ -323,7 +323,7 @@ nvext.agent_hints
 - `latency_sensitivity`：延迟敏感度。
 - `priority`：调度优先级。Dynamo 官方 Agents 文档说明 `priority` 可用于 engine queue ordering 和 KV cache eviction；NeMo Agent Toolkit 中通常按 `max_sensitivity - latency_sensitivity` 计算，数值越低优先级越高。[R6][R7]
 
-需要注意的是，Dynamo 官方 Agents 文档当前还列出一些更偏 serving/runtime 的字段，例如 `speculative_prefill`，并标注 `program_id`、`context_type` 为 planned；这说明 Dynamo 的 Agent Hints 正在向更丰富的 agentic serving metadata 扩展，但 `context_type` 这类语义类型在文档中仍是 planned，而不是本文所说 Sutradhara 式已落地的 token span 级语义标签。[R6]
+需要注意的是，Dynamo 官方 Agents 文档还列出一些更偏 serving/runtime 的字段，例如 `speculative_prefill`，并把 `program_id`、`context_type` 标为 planned。这说明 Dynamo 的 Agent Hints 正在向更丰富的 agentic serving metadata 扩展；但 `context_type` 这类语义类型在文档中仍是 planned，并不是本文讨论的 Sutradhara 式、已落地的 token span 级语义标签。[R6]
 
 ### 4.3 示例
 
@@ -344,9 +344,9 @@ nvext.agent_hints
 }
 ```
 
-第一次请求被路由到 Worker A。Worker A 计算并缓存了该 workflow 的长系统提示词 KV。
+第一次请求被路由到 Worker A，Worker A 计算并缓存了该 workflow 的长系统提示词 KV。
 
-第二次请求带相同 `prefix_id`。Dynamo 的 KV Router 发现 Worker A 已有相关前缀 KV，于是倾向继续路由到 Worker A，而不是轮询发给 Worker B。
+第二次请求带相同 `prefix_id`。Dynamo 的 KV Router 发现 Worker A 已有相关前缀 KV，于是倾向继续路由到 Worker A，而不是按轮询发给 Worker B。
 
 结果是：
 
@@ -355,7 +355,7 @@ nvext.agent_hints
 - 降低 TTFT。
 - 在多 Worker 场景中提升吞吐。
 
-该路由逻辑描述来自报告对 Dynamo KV Router、`prefix_id`、请求优先级和缓存亲和路由的总结，也可由 Dynamo Router README 佐证：KV Router 会评估 worker 的 prefill/decode 成本并利用 KV cache overlap 减少重复计算；`--router-queue-threshold` 等配置还会启用通过 `nvext.agent_hints.priority` 的优先级调度。[R2][R3][R8]
+该路由逻辑来自报告对 Dynamo KV Router、`prefix_id`、请求优先级和缓存亲和路由的总结，也可以从 Dynamo Router README 得到印证：KV Router 会评估 worker 的 prefill/decode 成本，并利用 KV cache overlap 减少重复计算；`--router-queue-threshold` 等配置还会启用基于 `nvext.agent_hints.priority` 的优先级调度。[R2][R3][R8]
 
 ### 4.4 优点
 
@@ -376,6 +376,8 @@ nvext.agent_hints
 
 ## 5. 三者对比
 
+把三者放在一起看，可以看到它们并不是互相替代的关系，而是分别站在不同层次上优化 KV Cache：
+
 | 维度 | Sutradhara | LMCache | Dynamo |
 |---|---|---|---|
 | 架构类型 | Orchestrator-Engine 协同设计 | 外置 KV Cache 管理层 | 分布式推理服务与 KV 感知路由 |
@@ -391,7 +393,7 @@ nvext.agent_hints
 
 ### 5.1 性能收益图引用
 
-> 注意：以下图片直接引用论文或官方公开资料中的原图。不同系统的硬件、模型、负载、baseline 和指标定义并不完全一致，因此这些图适合说明“机制带来的收益方向和量级”，不适合作为严格横向 benchmark。
+> 注意：以下图片直接引用论文或官方公开资料中的原图。不同系统的硬件、模型、负载、baseline 和指标定义并不完全一致，因此这些图适合说明机制带来的收益方向和量级，不适合作为严格横向 benchmark。
 
 #### 5.1.1 Sutradhara：论文 Figure 8 / 10 / 11
 
@@ -409,14 +411,14 @@ Sutradhara 论文 Figure 8 给出 serving capacity curves：横轴是 p50/p90 FT
 
 #### 5.1.2 Dynamo KV Router：官方资料边界
 
-报告中整理的 Dynamo KV Router 结果显示，在 Mooncake Tool Agent Traces 类场景下，KV-aware routing 相比轮询路由显著降低 TTFT 和端到端延迟。[R2]
+报告中整理的 Dynamo KV Router 结果显示，在 Mooncake Tool Agent Traces 类场景下，KV-aware routing 相比轮询路由显著降低 TTFT 和端到端延迟。[R2] 由于当前可核验的 Dynamo Router README 主要提供机制和配置说明，而不是可直接嵌入的论文性能图，本文不为 Dynamo 额外绘制图表。
 
 说明：
 
 - `TTFT 平均值约 20.4x`、`TTFT P99 约 15.9x`、`E2E 平均值约 4.3x`、`E2E P99 约 3.8x` 来自用户提供报告中对 Dynamo KV Router benchmark 的整理。[R2]
 - Dynamo Router README 说明 KV Router 会利用 KV cache overlap 和 worker 的 prefill/decode cost 做路由，减少重复 prefill；这解释了为什么长系统提示词、Agent 多轮前缀复用场景下收益明显。[R8]
 - Dynamo 的 `nvext.agent_hints` 和 `nvext.cache_control` 可进一步传递请求优先级、输出长度估计、prefix/session 相关信息，辅助路由和缓存生命周期控制。[R6][R7]
-- 当前可核验的 Dynamo 官方 Router 文档主要是机制说明和配置说明，没有在该 README 中提供可直接嵌入的论文性能图；因此这里不再自绘柱状图。
+- 没有加入额外图表，是为了避免把报告数值重新画成本文自制图。
 
 #### 5.1.3 LMCache：论文 Figure 8
 
@@ -442,9 +444,9 @@ LMCache 论文 Figure 8 对比了 basic vLLM、basic vLLM CPU offloading、两�
 
 ## 6. LMCache 能否结合 Sutradhara 的优点
 
-可以，但不是当前已有功能，需要扩展。
+可以，但这不是当前已有功能，需要在 LMCache 现有外置 KV 管理能力之上扩展。
 
-可行方向：
+一种可行方向是：
 
 1. Agent 编排器提交 token span 级语义 metadata：
 
@@ -469,28 +471,28 @@ USER_QUERY         普通优先级
 RESPONSE           优先驱逐
 ```
 
-5. 对 partial prefill，还需要 vLLM connector 和 scheduler 配合。
+5. 如果要支持 partial prefill，还需要 vLLM connector 和 scheduler 配合。
 
-这样 LMCache 可以保留外置 KV 管理和分层存储优势，同时吸收 Sutradhara 的语义感知能力。
+这样做的好处是：LMCache 仍然保留外置 KV 管理和分层存储优势，同时吸收 Sutradhara 的语义感知能力。
 
 ---
 
 ## 7. 面向 UMBP 的 Semantic KV Cache 管理系统设计
 
-这一节面向 `C:\Users\yangwu\Desktop\Git\mori` 中的 MORI-UMBP。结合当前 Mori 文档和测试，UMBP 更像一个高性能 KV cache 数据平面和分层内存池，而不是 Agent 编排器或 LLM 推理引擎本身。它已经具备 HBM/DRAM/SSD tier、master-as-advisor 路由、peer-owned allocator、external KV block index、hit count、read lease、prefix-aware eviction 和 eviction manager 等基础能力。[M1][M2][M3][M4][M5][M6]
+前面几节分别讨论了语义提示、外置 KV 管理和分布式路由。把这些思路落到 MORI-UMBP 时，需要先明确 UMBP 的定位：它更像一个高性能 KV cache 数据平面和分层内存池，而不是 Agent 编排器或 LLM 推理引擎本身。当前 UMBP 已经具备 HBM/DRAM/SSD tier、master-as-advisor 路由、peer-owned allocator、external KV block index、hit count、read lease、prefix-aware eviction 和 eviction manager 等基础能力。[M1][M2][M3][M4][M5][M6]
 
-因此，比较合适的设计不是把 Sutradhara 整套 co-design 直接搬进 UMBP，而是在 UMBP 上方增加一层 **Semantic KV Manager**：由 Agent/推理框架负责产生语义 hints，UMBP 负责把这些 hints 转换为 key、tier、路由和驱逐策略。
+因此，比较合适的方向不是把 Sutradhara 整套 co-design 直接搬进 UMBP，而是在 UMBP 上方增加一层 **Semantic KV Manager**：Agent/推理框架负责产生语义 hints，adapter 把 hints 转换成 key、tier、路由和驱逐策略，UMBP 继续负责高性能存储与搬运。
 
 ### 7.1 设计目标
 
-目标可以拆成四层：
+这个系统的目标可以拆成四层：
 
 1. **语义层**：吸收 Sutradhara 的 `SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / RESPONSE / PARTIAL_PREFILL` 思路，让系统知道不同 KV block 的复用价值。
 2. **分层层**：复用 UMBP 的 HBM、DRAM、SSD 以及 peer-to-peer 读取能力，把高价值 KV 尽量留在近端高性能 tier，把低价值或冷数据降到 SSD 或直接不保存。
 3. **路由层**：复用 UMBP master 的 advisor 模型和 external KV index，让请求优先路由到已经持有相关 KV block 的节点。
 4. **隔离层**：借鉴 LMCache 的 `lmcache.tag.*` 思路，把 tenant、agent、workflow、session、phase 放入逻辑 cache identity，避免跨租户或跨任务错误复用。
 
-这个设计的定位是：UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector 或 UMBP adapter 中。当前 UMBP repo 内没有 prompt、tool call、agent session 等一等公民对象，因此不要假设 UMBP 能直接产生 Sutradhara 式语义标签。
+也就是说，UMBP 仍然保持为高性能内存/带宽池；语义理解放在推理引擎 connector 或 UMBP adapter 中。当前 UMBP repo 内没有 prompt、tool call、agent session 等一等公民对象，因此不要假设 UMBP 能直接产生 Sutradhara 式语义标签。
 
 ### 7.2 建议架构
 
@@ -514,11 +516,11 @@ MORI-UMBP
         └─ PeerSsdManager: SSD cold tier and local LRU
 ```
 
-关键点是不要让 UMBP master 变成强一致 metadata 数据库。Mori 当前设计明确是 master-as-advisor：master 不拥有 page 状态，peer 才是 KV block 的真实 owner，master 只通过 heartbeat 投影 `GlobalBlockIndex`。[M2] 语义扩展也应保持这个方向：master 可以保存轻量 semantic summary 用于路由/驱逐排序，但不能把每次 token span 更新变成同步 master 写路径。
+这套架构最重要的约束，是不要让 UMBP master 变成强一致 metadata 数据库。Mori 当前设计明确是 master-as-advisor：master 不拥有 page 状态，peer 才是 KV block 的真实 owner，master 只通过 heartbeat 投影 `GlobalBlockIndex`。[M2] 语义扩展也应保持这个方向：master 可以保存轻量 semantic summary 用于路由和驱逐排序，但不能把每次 token span 更新变成同步 master 写路径。
 
 ### 7.3 Hint Schema
 
-建议定义一个独立于具体引擎的 `SemanticKvHint`。它不要求 UMBP 认识自然语言，只描述 KV block 的生命周期和复用价值：
+建议定义一个独立于具体引擎的 `SemanticKvHint`。它不要求 UMBP 认识自然语言，只负责描述 KV block 的生命周期和复用价值：
 
 ```text
 SemanticKvHint:
@@ -536,7 +538,7 @@ SemanticKvHint:
   tool_name:       optional, for TOOL_OUTPUT
 ```
 
-其中 `phase` 学 Sutradhara，`tenant_id / agent_id / workflow_id / session_id` 学 LMCache 的 tag isolation。UMBP 不应只用 token hash 作为 key，否则不同租户共享相同系统提示词时可能发生不期望的跨域复用。推荐 cache key 使用：
+其中 `phase` 借鉴 Sutradhara，`tenant_id / agent_id / workflow_id / session_id` 借鉴 LMCache 的 tag isolation。UMBP 不应只用 token hash 作为 key，否则不同租户共享相同系统提示词时可能发生不期望的跨域复用。推荐 cache key 使用：
 
 ```text
 cache_key = hash(
@@ -554,7 +556,7 @@ cache_key = hash(
 
 ### 7.4 写入流程
 
-保存 KV 时，adapter 把 prompt 的 token span 切成 UMBP 可以管理的 page/chunk，然后按 phase 决定是否保存和保存到哪里：
+保存 KV 时，adapter 先把 prompt 的 token span 切成 UMBP 可以管理的 page/chunk，再按 phase 决定是否保存以及保存到哪里：
 
 | Phase | 写入策略 | 理由 |
 |---|---|---|
@@ -564,25 +566,25 @@ cache_key = hash(
 | `RESPONSE` | 默认不保存，或只短 TTL 保存 | 多数最终回答复用价值低 |
 | `PARTIAL_PREFILL` | 保存并临时 pin，事件完成后降级 | 工具执行期间最需要保护 |
 
-映射到当前 UMBP，可以分两类：
+映射到当前 UMBP，可以先分成两类路径：
 
 - **UMBP-owned KV**：KV bytes 由 UMBP 管理，走 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()`，内部使用 `RoutePut`、peer `AllocateSlot`、RDMA 写入、`CommitSlot`、heartbeat `KvEvent` 进入 `GlobalBlockIndex`。[M2][M4]
 - **External KV metadata**：KV bytes 仍在 SGLang/vLLM 自己的 host cache 或 HBM cache 中，只把 hash 和 tier 报给 UMBP master，走 `report_external_kv_blocks()` / `match_external_kv()`。这适合做 KV-aware routing，不直接搬运 bytes。[M2][M5]
 
-一个保守落地路径是先做 external KV metadata：风险小，不改 UMBP 数据面；等路由收益确认后，再把高价值 `SYSTEM_PROMPT` 和 `PARTIAL_PREFILL` 接入 UMBP-owned KV。
+更保守的落地路径是先做 external KV metadata：风险小，不改 UMBP 数据面；等路由收益确认后，再把高价值 `SYSTEM_PROMPT` 和 `PARTIAL_PREFILL` 接入 UMBP-owned KV。
 
 ### 7.5 读取与路由流程
 
-读取流程可以分两级：
+读取和路由可以分两级：
 
 1. **路由前匹配**：请求进入 router 前，adapter 用本次 prompt 的 chunk hashes 调用 `match_external_kv()` 或新增的 semantic match API，找出哪些节点持有相同前缀。UMBP 已经支持 external KV block 的 report/match 和 hit count，这可以直接作为 cache-affinity router 的基础。[M5]
 2. **读取时加载**：如果 KV bytes 在 UMBP-owned tier 中，adapter 对缺失的 chunk 调用 `batch_get_into_ptr()`。UMBP master 的 `RouteGet` 会按 HBM > DRAM > SSD 选择最快 tier；命中时还会 `RecordAccess` 和 `GrantLease`，避免读取过程中被驱逐。[M2][M4]
 
-这相当于把 Dynamo 的 KV-aware routing 和 LMCache 的 external KV retrieve 合并到 UMBP 的 master/peer 架构里。
+这样做相当于把 Dynamo 的 KV-aware routing 和 LMCache 的 external KV retrieve 思路，落到 UMBP 的 master/peer 架构里。
 
 ### 7.6 语义驱逐策略
 
-UMBP 当前 master eviction manager 主要在 HBM/DRAM 过水位时找 LRU candidate，并通过 `EvictKey` 通知 peer；SSD tier 则由 peer-local watermark + LRU 回收。[M2] 要结合 Sutradhara，建议把 eviction score 从单纯 LRU 扩展成：
+UMBP 当前的 master eviction manager 主要在 HBM/DRAM 过水位时查找 LRU candidate，并通过 `EvictKey` 通知 peer；SSD tier 则由 peer-local watermark + LRU 回收。[M2] 要结合 Sutradhara，建议把 eviction score 从单纯 LRU 扩展成：
 
 ```text
 eviction_score =
@@ -604,7 +606,7 @@ USER_QUERY       中低，session TTL 内保留
 RESPONSE         低，优先驱逐或默认 skip-save
 ```
 
-实现上不要让 master 直接管理每个 token span 的复杂状态。更合适的是 peer 在 heartbeat 事件中携带轻量 metadata summary，例如 `phase`、`priority`、`ttl`、`reuse_scope`；master 的 `GlobalBlockIndex` 只保存驱逐和路由需要的字段。peer 仍然是最终 owner，master 只排序候选并发出 `EvictKey`。
+实现上不应让 master 直接管理每个 token span 的复杂状态。更合适的是由 peer 在 heartbeat 事件中携带轻量 metadata summary，例如 `phase`、`priority`、`ttl`、`reuse_scope`；master 的 `GlobalBlockIndex` 只保存驱逐和路由需要的字段。peer 仍然是最终 owner，master 只负责排序候选并发出 `EvictKey`。
 
 ### 7.7 与 UMBP 现有能力的对应关系
 
@@ -625,7 +627,7 @@ RESPONSE         低，优先驱逐或默认 skip-save
 
 在 SGLang/vLLM adapter 中生成 `SemanticKvHint`，把 `SYSTEM_PROMPT`、`TOOL_OUTPUT` 等 phase 进入 cache key namespace；KV bytes 仍由引擎持有，只通过 `report_external_kv_blocks()` 上报 hash 到 UMBP master。router 根据 `match_external_kv()` 结果做节点亲和。
 
-如果先不改 master 数据结构，可以把 `SYSTEM_PROMPT` 等稳定前缀映射为更大的 prefix depth，复用现有 prefix-aware LRU；但这只是位置/链路深度信号，不等价于真正的 `SYSTEM_PROMPT` 语义枚举。
+如果暂时不改 master 数据结构，可以把 `SYSTEM_PROMPT` 等稳定前缀映射为更大的 prefix depth，复用现有 prefix-aware LRU；但这只是位置/链路深度信号，不等价于真正的 `SYSTEM_PROMPT` 语义枚举。
 
 **阶段 2：接入 UMBP-owned KV for 高价值前缀。**
 
@@ -669,7 +671,7 @@ UMBP Semantic KV Manager 可以这样处理：
 - `RESPONSE` 默认 skip-save，避免污染 HBM/DRAM。
 - 下一次同一 tenant 的报表 Agent 请求进来时，router 先通过 external KV match 找到已有系统提示词 KV 的节点，再由 UMBP `RouteGet` 从 HBM/DRAM 读取缺失 chunk；如果热层被驱逐但 SSD 还有副本，则从 SSD 回填。
 
-这样得到的系统形态是：Sutradhara 负责“知道什么重要”，LMCache 思路负责“把 tags 变成 cache identity 和生命周期”，UMBP 负责“把 KV bytes 放在合适的节点和 tier，并高速搬运”。
+这样得到的系统形态可以概括为：Sutradhara 负责“知道什么重要”，LMCache 思路负责“把 tags 变成 cache identity 和生命周期”，UMBP 负责“把 KV bytes 放在合适的节点和 tier，并高速搬运”。
 
 ---
 
@@ -683,7 +685,7 @@ Sutradhara、LMCache、Dynamo 代表了 Agent Hints 在 KV Cache 系统中的三
 
 **Dynamo** 代表分布式路由优化路线。它通过请求级 hints 提升多 Worker 场景下的 KV 局部性和调度质量，特别适合生产集群。
 
-长期来看，更理想的方向是三者结合：
+长期来看，更理想的方向是把这些能力组合起来：
 
 - Dynamo 做请求路由。
 - LMCache 做外置 KV 管理和分层存储。
@@ -696,9 +698,9 @@ Sutradhara、LMCache、Dynamo 代表了 Agent Hints 在 KV Cache 系统中的三
 
 ### 外部资料
 
-- [R1] `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`：第 2.1 节 “Sutradhara：Orchestrator-Engine Co-design 与语义标记”；第 3.1、3.4 节对语义标记和复用优先级的总结。报告引用 Biswas et al., “Sutradhara: An Intelligent Orchestrator-Engine Co-design for Tool-based Agentic Inference.”
-- [R2] `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`：第 2.2 节 “NVIDIA Dynamo：Agent Hints 与 KV 感知路由”；第 3.2、3.3 节对路由提示和生命周期控制的总结。
-- [R3] `c:\Users\yangwu\Downloads\Kimi_Agent_KVCache代理提示\report.md`：第 4.1 节 “Co-design vs. Layered Architecture”；第 4.2 节对 LMCache 作为引擎无关连接器方案的总结。
+- [R1] 用户提供的调研报告 `report.md`：第 2.1 节 “Sutradhara：Orchestrator-Engine Co-design 与语义标记”；第 3.1、3.4 节对语义标记和复用优先级的总结。报告引用 Biswas et al., “Sutradhara: An Intelligent Orchestrator-Engine Co-design for Tool-based Agentic Inference.”
+- [R2] 用户提供的调研报告 `report.md`：第 2.2 节 “NVIDIA Dynamo：Agent Hints 与 KV 感知路由”；第 3.2、3.3 节对路由提示和生命周期控制的总结。
+- [R3] 用户提供的调研报告 `report.md`：第 4.1 节 “Co-design vs. Layered Architecture”；第 4.2 节对 LMCache 作为引擎无关连接器方案的总结。
 - [R4] Sutradhara arXiv HTML：`https://arxiv.org/html/2601.12967`。该页面列出 `submit_partial_prefill()`、`extend_prefill()`、`register_streaming_callback()`、`tag_kv_blocks()`、`set_reuse_priority()` 等 API，并描述 partial prefill、语义 KV block tagging 和 priority-based eviction。
 - [R5] Microsoft Research 发布页：`https://www.microsoft.com/en-us/research/publication/sutradhara-an-intelligent-orchestrator-engine-co-design-for-tool-based-agentic-inference/`。该页总结了 Sutradhara 的 co-design 动机、三类优化，以及在 vLLM/A100 上降低 FTR 和端到端延迟的结果。
 - [R6] NVIDIA Dynamo 官方 Agents 文档：`https://docs.dynamo.nvidia.com/dynamo/user-guides/agents`。该页说明 agent-facing request metadata 位于 `nvext`，`agent_hints` 可携带 priority、expected output length、speculative prefill 等 serving-relevant intent，并提到 priority、osl、planned `context_type` 等字段。
@@ -719,9 +721,9 @@ Sutradhara、LMCache、Dynamo 代表了 Agent Hints 在 KV Cache 系统中的三
 
 ### MORI / UMBP 代码出处
 
-- [M1] `C:\Users\yangwu\Desktop\Git\mori\README.md`：MORI 是 RDMA + GPU 通信框架，UMBP 是 unified memory & bandwidth pool，提供 tiered storage 和 distributed key-value access。
-- [M2] `C:\Users\yangwu\Desktop\Git\mori\src\umbp\doc\design-master-control-plane.md`：UMBP master-as-advisor、peer-owned allocator、`GlobalBlockIndex`、`ExternalKvBlockIndex`、`RouteGet` / `RoutePut`、HBM/DRAM/SSD tier、eviction 和 hot-path Put/Get 流程。
-- [M3] `C:\Users\yangwu\Desktop\Git\mori\src\umbp\doc\runtime-env-vars.md`：UMBP runtime knobs，包括 heartbeat、lease、SSD、SPDK proxy tenant quota、`UMBP_CACHE_REMOTE_FETCHES` 等。
-- [M4] `C:\Users\yangwu\Desktop\Git\mori\tests\python\umbp\test_umbp_client_ptr.py`：Python `UMBPClient` 指针 API 示例，包括 `put_from_ptr`、`get_into_ptr`、`batch_put_from_ptr`、`batch_get_into_ptr` 和 SSD-enabled round trip。
-- [M5] `C:\Users\yangwu\Desktop\Git\mori\tests\python\umbp\test_umbp_master_client.py`：External KV block report/match/revoke、multi-tier registration、hit count 和 master client 行为测试。
-- [M6] `C:\Users\yangwu\Desktop\Git\mori\src\umbp\include\umbp\umbp_client.h`、`C:\Users\yangwu\Desktop\Git\mori\src\umbp\local\tiers\local_storage_manager.cpp`、`C:\Users\yangwu\Desktop\Git\mori\tests\cpp\umbp\local\test_prefix_aware_eviction.cpp`：`BatchPutWithDepth` 和 `prefix_aware_lru` 使用 radix-tree chain depth 作为本地 eviction priority 信号。
+- [M1] `mori/README.md`：MORI 是 RDMA + GPU 通信框架，UMBP 是 unified memory & bandwidth pool，提供 tiered storage 和 distributed key-value access。
+- [M2] `mori/src/umbp/doc/design-master-control-plane.md`：UMBP master-as-advisor、peer-owned allocator、`GlobalBlockIndex`、`ExternalKvBlockIndex`、`RouteGet` / `RoutePut`、HBM/DRAM/SSD tier、eviction 和 hot-path Put/Get 流程。
+- [M3] `mori/src/umbp/doc/runtime-env-vars.md`：UMBP runtime knobs，包括 heartbeat、lease、SSD、SPDK proxy tenant quota、`UMBP_CACHE_REMOTE_FETCHES` 等。
+- [M4] `mori/tests/python/umbp/test_umbp_client_ptr.py`：Python `UMBPClient` 指针 API 示例，包括 `put_from_ptr`、`get_into_ptr`、`batch_put_from_ptr`、`batch_get_into_ptr` 和 SSD-enabled round trip。
+- [M5] `mori/tests/python/umbp/test_umbp_master_client.py`：External KV block report/match/revoke、multi-tier registration、hit count 和 master client 行为测试。
+- [M6] `mori/src/umbp/include/umbp/umbp_client.h`、`mori/src/umbp/local/tiers/local_storage_manager.cpp`、`mori/tests/cpp/umbp/local/test_prefix_aware_eviction.cpp`：`BatchPutWithDepth` 和 `prefix_aware_lru` 使用 radix-tree chain depth 作为本地 eviction priority 信号。
