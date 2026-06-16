@@ -1,4 +1,4 @@
-# Agent Hints 与 KV Cache 系统调研：Sutradhara、LMCache、Dynamo 对比
+# Agent Hints 与 KV Cache 系统调研及设计：Sutradhara、LMCache、Dynamo 对比与 UMBP 方案
 
 ## 0. 阅读范围与判断口径
 
@@ -27,7 +27,7 @@ Sutradhara、LMCache、NVIDIA Dynamo 都在解决 Agent 工作流里的 KV Cache
 
 ### 2.1 实现方式
 
-Sutradhara 的核心做法，是让 Agent 编排器把 prompt 的内部结构告诉推理引擎。根据论文 HTML 和 Microsoft Research 发布页，它通过一组 thin API 把编排器信息传给引擎，覆盖工具感知 prompt splitting、流式工具调度，以及语义提示驱动的缓存管理。[R1][R4][R5]
+Sutradhara 的核心做法，是让 Agent 编排器把 prompt 的内部结构告诉推理引擎。根据公开论文和 Microsoft Research 的介绍，它提供了一组 thin API，用来把编排器侧的信息传给引擎；这些 API 支持工具感知的 prompt splitting、流式工具调度，以及由语义提示驱动的缓存管理。[R1][R4][R5]
 
 论文列出的核心 API 包括：
 
@@ -473,6 +473,39 @@ RESPONSE           优先驱逐
 
 这样做的好处是：LMCache 仍然保留外置 KV 管理和分层存储优势，同时吸收 Sutradhara 的语义感知能力。
 
+### 6.1 结合后的直接好处
+
+如果 LMCache 引入 Sutradhara 式语义 hints，收益主要来自三方面。
+
+第一，**缓存保留更聪明**。当前 LMCache 可以复用精确 token 前缀，但不理解这段前缀为什么重要。加入语义 metadata 后，系统可以知道 `SYSTEM_PROMPT`、工具 schema、长期复用的工具输出比一次性 `RESPONSE` 更值得保留。这样在缓存空间紧张时，eviction policy 不再只看 LRU/LFU，而是优先淘汰低复用价值内容。
+
+第二，**多轮 Agent 的命中率更稳定**。Agent 工作流里，系统提示词、工具 schema、历史上下文经常跨轮次复用；工具输出和最终回答则复用价值差异很大。语义 hints 可以帮助 LMCache 在多轮请求中保住高价值 KV chunk，减少“刚要复用就被淘汰”的情况。
+
+第三，**外置 KV 管理仍然保持松耦合**。Sutradhara 的优势是语义强，但需要引擎和编排器深度协同；LMCache 的优势是外置 KV 管理、分层存储和跨 backend 复用。结合后的理想状态是：语义判断来自 orchestrator 或 connector，KV 存储、迁移、加载和隔离仍由 LMCache 负责。
+
+### 6.2 对性能提升的预期
+
+这种结合可能带来性能提升，但不能简单套用 Sutradhara 或 LMCache 论文中的数字。更准确的说法是：它会改善几个直接影响性能的指标。
+
+| 指标 | 预期变化 | 原因 |
+|---|---|---|
+| Prefix / chunk 命中率 | 提升 | 高价值前缀更不容易被驱逐。 |
+| TTFT / FTR | 降低 | 命中 KV 后减少 prefill 计算。 |
+| Tail latency | 降低 | 多轮 Agent 中少一些高代价 cache miss。 |
+| 有效吞吐 | 提升 | GPU 少做重复 prefill，可服务更多请求。 |
+| Cache 污染 | 降低 | `RESPONSE`、一次性工具输出等低价值内容可少存或优先驱逐。 |
+
+其中最有希望改善的是长系统提示词、多工具 schema、多轮工具调用这类场景。原因是这些 workload 里存在大量稳定前缀，如果它们被正确保留，LMCache 的 retrieve 能直接减少 prefill 成本。
+
+但也有边界：
+
+- 如果请求之间几乎没有共享前缀，语义 hints 也无法创造 KV 命中。
+- 如果瓶颈主要在 decode，而不是 prefill，TTFT/FTR 可能改善，但端到端延迟改善有限。
+- 如果只把 `phase` 放进 cache key，而不改 eviction policy，收益主要是隔离更准确，不会自动带来更高保留优先级。
+- 如果要获得 Sutradhara 式 partial prefill 收益，还必须改 connector/scheduler；单靠 LMCache storage layer 不够。
+
+因此，结合后的性能提升应通过 benchmark 验证，重点看 cache hit rate、TTFT/FTR、P90/P99 latency、GPU prefill 时间占比和 cache eviction 行为。可以参考 Sutradhara 用语义标签提升 hit rate 和降低 FTR 的思路，也可以参考 LMCache 论文中外置 KV 复用降低 TTFT、提升吞吐的评估方式，但最终数字需要在具体模型、负载和缓存容量下实测。[R4][R5][R9]
+
 ---
 
 ## 7. 面向 UMBP 的 Semantic KV Cache 管理系统设计
@@ -543,7 +576,9 @@ SemanticKvHint:
   tool_name:       optional, for TOOL_OUTPUT
 ```
 
-其中 `phase` 借鉴 Sutradhara，`tenant_id / agent_id / workflow_id / session_id` 借鉴 LMCache 的 tag isolation。UMBP 不应只用 token hash 作为 key，否则不同租户共享相同系统提示词时可能发生不期望的跨域复用。推荐 cache key 使用：
+其中 `phase` 借鉴 Sutradhara，`tenant_id / agent_id / workflow_id / session_id` 借鉴 LMCache 的 tag isolation。UMBP 可以复用 LMCache 的 key 设计思想，但不是复用 LMCache 的 `CacheEngineKey` 类。具体做法是在 UMBP Semantic KV Adapter 中生成 canonical key，把 token chunk hash、模型信息、租户/会话隔离信息和语义 phase 编码进去；UMBP 只把它当作 opaque string key 来索引、路由和读写 KV。
+
+UMBP 不应只用 token hash 作为 key，否则不同租户共享相同系统提示词时可能发生不期望的跨域复用。推荐 cache key 使用：
 
 ```text
 cache_key = hash(
@@ -553,7 +588,8 @@ cache_key = hash(
   token_chunk_hash,
   tenant_id,
   agent_id or workflow_id,
-  reuse_scope
+  reuse_scope,
+  phase
 )
 ```
 
@@ -626,7 +662,28 @@ RESPONSE         低，优先驱逐或默认 skip-save
 | 租户隔离 | SPDK proxy tenant id、外部 key namespace | 显式 cache key schema 和 quota 维度 |
 | 粗粒度标签 | client registration tags | 当前主要用于 metrics/observability；若用于路由需扩展策略 |
 
-### 7.8 建议分阶段落地
+上表是从“UMBP 方案需要什么能力”出发来看。为了避免把 LMCache 的高层 API 直接等同于 UMBP 现有功能，还需要反过来从 LMCache 的能力清单看一遍：哪些能力 UMBP 已经能承接，哪些应该留给 adapter 或后续策略层。
+
+### 7.8 从 LMCache 能力看 UMBP 的承接边界
+
+两者有明显重叠，但不是一一对应。UMBP 已经具备分层存储、分布式索引、Put/Get、RouteGet/RoutePut、External KV match 和 lease 等底层能力；但 LMCache 的部分高层语义，例如 `cache_salt`、`lmcache.tag.*`、`skip_save`、显式 `pin/unpin` 和 `compress/decompress`，需要由 adapter 或后续策略层补齐。
+
+| LMCache 能力 | UMBP 当前是否有对应 | UMBP 中的大致对应 |
+|---|---|---|
+| `lookup` | 部分有 | `BatchLookup`、`RouteGet`、`match_external_kv()`。 |
+| `store / retrieve` | 有 | `put_from_ptr` / `get_into_ptr`，`batch_put_from_ptr` / `batch_get_into_ptr`。 |
+| `pin / unpin` | 部分有 | `RouteGet` 会 grant read lease；peer 有 read lease / SSD lease，但不是 LMCache 式显式 `pin/unpin` API。 |
+| `move` | 不等价 | UMBP 有跨节点 RDMA 读写和 SSD copy-on-commit，但没有 LMCache 式显式 `move(key, src, dst)`。 |
+| `clear` | 有 | `clear()`、external KV revoke、clear-at-tier 类能力。 |
+| `compress / decompress` | 未见原生对应 | UMBP 主要做存储、搬运和分层，不是 KV 压缩系统。 |
+| `cache_salt` | 没有同名机制 | 可通过 key namespace、tenant id、SPDK proxy tenant id 做隔离，但不是同一个字段。 |
+| `lmcache.tag.*` | 没有同名机制 | 可通过 key namespace、client registration tags、external metadata 扩展模拟；当前不是原生语义 tag。 |
+| `lmcache.skip_save` | 没有同名机制 | Adapter 可以选择不调用 UMBP put/report，相当于在上层实现 skip-save。 |
+| 分层存储 | 有 | HBM / DRAM / SSD tier，SSD copy-on-commit，peer-local SSD LRU。 |
+
+因此，在 UMBP 方案里更准确的说法是：UMBP 可以承接 LMCache 思路中的“分层存储、外部 KV 读写、路由索引和缓存隔离”；但 `cache_salt`、tag、skip-save、semantic policy 这类高层语义，应放在 UMBP Semantic KV Adapter 中实现。这个边界明确以后，分阶段落地就更清楚：先用 UMBP 已有能力做外部 KV routing，再逐步补齐语义 key、tier policy 和 eviction priority。
+
+### 7.9 建议分阶段落地
 
 **阶段 1：只做语义 key 和 external KV routing。**
 
@@ -646,7 +703,7 @@ RESPONSE         低，优先驱逐或默认 skip-save
 
 当 Agent 发起工具调用时，adapter 把工具无关前缀标为 `PARTIAL_PREFILL` 并 pin；工具结果返回并完成 `extend_prefill` 后，把它降级为 `TOOL_OUTPUT` 或 `USER_QUERY`。这一步最接近 Sutradhara，但需要推理引擎 scheduler 配合，不能只靠 UMBP 完成。
 
-### 7.9 风险与边界
+### 7.10 风险与边界
 
 - **UMBP 不应负责解析 prompt。** 语义识别应由 Agent orchestrator 或推理框架 adapter 完成。
 - **不要默认跨租户复用。** 只有明确 `reuse_scope = GLOBAL` 的 KV 才能跨 tenant。
@@ -655,7 +712,7 @@ RESPONSE         低，优先驱逐或默认 skip-save
 - **partial prefill 不是纯 cache 功能。** 它需要引擎能提前 prefill、暂停、扩展上下文；UMBP 只能提供 KV 存储、pin 和跨节点搬运。
 - **SSD 适合兜底，不适合热路径默认读取。** UMBP 当前 `RouteGet` 已按 HBM > DRAM > SSD 选择 tier，语义策略应顺着这个模型，而不是让高频请求频繁走 SSD。
 
-### 7.10 一个具体例子
+### 7.11 一个具体例子
 
 假设一个企业报表 Agent 的请求结构是：
 
