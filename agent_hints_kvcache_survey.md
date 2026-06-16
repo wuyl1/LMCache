@@ -513,13 +513,13 @@ UMBP Semantic KV Adapter
         ▼
 MORI-UMBP
         │
-        ├─ 路由层：MasterServer, RouteGet / RoutePut, GlobalBlockIndex, ExternalKvBlockIndex
-        ├─ 分层层：PeerServiceServer, AllocateSlot / ResolveKey / PrepareSsdRead
-        ├─ 分层层：PeerDramAllocator, HBM/DRAM canonical owner
-        └─ 分层层：PeerSsdManager, SSD cold tier and local LRU
+        ├─ 现有路由基础：MasterServer, RouteGet / RoutePut, GlobalBlockIndex, ExternalKvBlockIndex
+        ├─ 现有读写基础：PeerServiceServer, AllocateSlot / ResolveKey / PrepareSsdRead
+        ├─ 现有热层存储：PeerDramAllocator, HBM/DRAM canonical owner
+        └─ 现有冷层存储：PeerSsdManager, SSD cold tier and local LRU
 ```
 
-因此，四层和三块组件不是一一对应关系。Agent/推理框架主要负责语义层；adapter 是核心翻译层，承担隔离、分层策略和路由策略；MORI-UMBP 执行真正的分层存储、跨节点查找和 KV 搬运。
+因此，四层和三块组件不是一一对应关系。Agent/推理框架主要负责语义层；adapter 是核心翻译层，承担隔离、分层策略和路由策略；MORI-UMBP 提供已有的路由索引、分层存储、跨节点查找和 KV 搬运能力。语义感知路由、语义分层和语义驱逐不是 UMBP 当前原生能力，需要由 adapter 和后续策略扩展补上。
 
 这套架构最重要的约束，是不要让 UMBP master 变成强一致 metadata 数据库。Mori 当前设计明确是 master-as-advisor：master 不拥有 page 状态，peer 才是 KV block 的真实 owner，master 只通过 heartbeat 投影 `GlobalBlockIndex`。[M2] 语义扩展也应保持这个方向：master 可以保存轻量 semantic summary 用于路由和驱逐排序，但不能把每次 token span 更新变成同步 master 写路径。
 
