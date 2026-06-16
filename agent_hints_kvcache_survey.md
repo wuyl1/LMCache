@@ -658,9 +658,12 @@ Adapter 先按 token span 切分 KV，再给每段 KV 生成 hint 和 key：
 
 **第三层：UMBP 按 adapter 的决策执行。**
 
-如果先走 external KV metadata 路径，KV bytes 仍在 vLLM/SGLang 的 cache 里，adapter 只把系统提示词等前缀的 hash 和所在节点上报给 UMBP。下一次同一 tenant 的报表请求进来时，adapter 调 `match_external_kv()`，UMBP master 可以发现“某个 peer/worker 已经有这段系统提示词 KV”，router 就优先把请求送到那个节点，减少重复 prefill。
+UMBP 的执行可以拆成四步：
 
-如果后续把高价值 KV 交给 UMBP-owned KV，adapter 会对 `SYSTEM_PROMPT` 或高命中 `TOOL_OUTPUT` 调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择合适 peer，peer 真正分配 HBM/DRAM/SSD 空间并保存 KV bytes。读取时，adapter 对缺失 chunk 调 `batch_get_into_ptr()`；UMBP 通过 `RouteGet` 选择最快 tier，优先从 HBM/DRAM 返回，如果热层没有但 SSD 有副本，再从 SSD 回填。
+1. **先做路由匹配。** 如果 KV bytes 还留在 vLLM/SGLang 自己的 cache 里，adapter 只把 `SYSTEM_PROMPT` 等前缀的 hash、所在节点和 tier 上报给 UMBP master。下一次同一 tenant 的报表请求进来时，adapter 调 `match_external_kv()`；master 返回“哪些节点可能已有这段前缀 KV”。router 就优先把请求送到这些节点，让推理引擎直接复用本地 KV，减少重复 prefill。
+2. **再决定是否写入 UMBP。** 如果 adapter 判断某段 KV 值得由 UMBP 托管，例如稳定的 `SYSTEM_PROMPT` 或高命中的 `TOOL_OUTPUT`，就调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择合适 peer；peer 分配 HBM/DRAM/SSD 空间，真正保存 KV bytes。
+3. **读取时按最快 tier 取回。** 后续请求缺少某些 chunk 时，adapter 调 `batch_get_into_ptr()`。UMBP master 通过 `RouteGet` 查 `GlobalBlockIndex`，优先选择 HBM/DRAM 中的副本；如果热层没有但 SSD 还有副本，再从 SSD 回填。
+4. **回收时参考轻量语义。** 当 HBM/DRAM 有压力时，UMBP 仍然由 peer 执行实际驱逐；adapter 提供的 `phase / priority / ttl` 只作为排序提示。比如 `SYSTEM_PROMPT` 尽量保留，`RESPONSE` 因为没有写入也不会占用 cache。
 
 这个例子的重点不是让 UMBP 理解“报表”或“SQL”的业务含义，而是让 adapter 把这些业务上下文变成简单、可执行的缓存策略：系统提示词稳定复用，所以尽量保留；用户问题只在会话内短期保留；工具结果要看是否常用；最终回答默认不保存。
 
