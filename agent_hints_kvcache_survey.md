@@ -510,180 +510,93 @@ RESPONSE           优先驱逐
 
 ## 7. RFC：面向 UMBP 的 Semantic KV Cache 管理方案
 
-前面几节分别讨论了语义提示、外置 KV 管理和分布式路由。把这些思路落到 MORI-UMBP 时，最重要的是先划清边界：**不要把 Agent 语义逻辑放进 UMBP core**。
+把 Sutradhara、LMCache 和 Dynamo 的思路落到 MORI-UMBP 时，可以先用一句话理解：**不要让 UMBP 自己理解 Agent 语义，而是在 UMBP 前面加一层翻译器**。
 
-UMBP 更像一个高性能 KV block pool 和分层内存池。它已经有 HBM/DRAM/SSD tier、master-as-advisor 路由、peer-owned allocator、external KV index、hit count、read lease、prefix-aware eviction 和 eviction manager 等底层能力。[M1][M2][M3][M4][M5][M6] 但它不理解 prompt、tool call、session 或 `SYSTEM_PROMPT` 这类语义。
+UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD，不同节点之间查找和搬运 KV，并通过 master 给读写请求做路由建议。[M1][M2][M3][M4][M5][M6] 但它不知道一段 token 是系统提示词、用户问题、工具结果，还是最终回答。
 
-因此，推荐设计是在 UMBP 外侧增加一层 **Semantic KV Adapter**：
+因此，推荐增加一层 **Semantic KV Adapter**。它像“标签员 + 调度员”：先给 KV block 打上简单标签，再决定 key 怎么生成、是否保存、放在哪个 tier、读请求应该尽量路由到哪个节点。UMBP core 只继续做它擅长的事情：按 opaque key 存、查、搬运 KV bytes。
 
-- Agent / 推理框架提供 message、tool event、RAG context、session metadata 等上下文。
-- Adapter 从这些上下文中生成 `SemanticKvHint`，并转成 canonical key、tier policy、routing policy 和 skip-save 决策。
-- UMBP core 继续只处理 opaque key、HBM/DRAM/SSD tier、RouteGet/RoutePut、external KV index、lease 和数据搬运。
-
-### 7.1 建议架构
+### 7.1 整体结构
 
 ```text
 Agent Orchestrator / SGLang / vLLM
         │
-        ├─ 语义层：提供 messages / tool events / RAG context / session metadata
-        │
-        │  semantic context
+        │  messages / tool events / RAG context / session metadata
         ▼
 UMBP Semantic KV Adapter
         │
-        ├─ Hint Producer：从 semantic context 生成 SemanticKvHint
-        ├─ 隔离层：生成 canonical cache key
-        ├─ 按 token span 切分 page / chunk
-        ├─ 分层层：把 semantic class 转成 tier policy / eviction priority
-        ├─ 路由层：查询 external KV / RouteGet，选择已有 KV 的节点
-        ├─ 调用 UMBPClient put/get 或 external KV APIs
+        │  生成 hint / key / routing policy / tier policy
         ▼
 MORI-UMBP
         │
-        ├─ 现有路由基础：MasterServer, RouteGet / RoutePut, GlobalBlockIndex, ExternalKvBlockIndex
-        ├─ 现有读写基础：PeerServiceServer, AllocateSlot / ResolveKey / PrepareSsdRead
-        ├─ 现有热层存储：PeerDramAllocator, HBM/DRAM canonical owner
-        └─ 现有冷层存储：PeerSsdManager, SSD cold tier and local LRU
+        │  opaque key + RouteGet/RoutePut + HBM/DRAM/SSD
 ```
 
-这张图的含义是：Agent/推理框架提供可提取语义的上下文；adapter 是核心翻译层；MORI-UMBP 只执行已有的路由索引、分层存储、跨节点查找和 KV 搬运能力。语义感知路由、语义分层和语义驱逐不是 UMBP 当前原生能力，也不建议直接塞进 UMBP core。
+这里有两个边界需要保持清楚：
 
-这套架构最重要的约束，是不要让 UMBP master 变成强一致 metadata 数据库。Mori 当前设计明确是 master-as-advisor：master 不拥有 page 状态，peer 才是 KV block 的真实 owner，master 只通过 heartbeat 投影 `GlobalBlockIndex`。[M2] 语义扩展也应保持这个方向：master 可以保存轻量 semantic summary 用于路由和驱逐排序，但不能把每次 token span 更新变成同步 master 写路径。
+- **Adapter 理解语义。** 它看 message role、tool event、session metadata，并把这些信息转成 key 和策略。
+- **UMBP 保存和搬运 KV。** 它不解析 prompt，不判断语义，只按照 key、tier 和轻量 metadata 做存储、路由和回收。
+
+UMBP master 和 peer 的关系也可以简单理解：master 像“问路台”，peer 像“仓库”。master 通过 heartbeat 维护一个近似的 `GlobalBlockIndex`，告诉请求应该去哪个 peer；真正保存、读取和释放 KV block 的是 peer。[M2] 因此语义 metadata 也应该轻量、异步上报，不能让每个 token span 更新都同步写 master。
 
 ### 7.2 Hint 和 Key
 
-Adapter 可以定义一个独立于具体引擎的 `SemanticKvHint`。它不要求 UMBP 认识自然语言，只描述 KV block 的生命周期和复用价值：
+Adapter 可以定义一个简单的 `SemanticKvHint`，描述一段 KV 的来源和生命周期。它不需要很复杂，核心字段类似：
 
 ```text
-SemanticKvHint:
-  tenant_id:       "tenant-a"
-  agent_id:        "research-agent"
-  workflow_id:     "report-generation"
-  session_id:      "session-20260616-001"
-  phase:           SYSTEM_PROMPT | USER_QUERY | TOOL_OUTPUT | RESPONSE | PARTIAL_PREFILL
-  span_start:      token offset
-  span_end:        token offset
-  reuse_scope:     GLOBAL | TENANT | AGENT | SESSION | REQUEST
-  ttl_ms:          optional lifetime
-  priority:        optional numeric override
-  pin_until:       optional timestamp or event id
-  tool_name:       optional, for TOOL_OUTPUT
+tenant_id / agent_id / workflow_id / session_id
+phase = SYSTEM_PROMPT | USER_QUERY | TOOL_OUTPUT | RESPONSE | PARTIAL_PREFILL | UNKNOWN
+reuse_scope = GLOBAL | TENANT | AGENT | SESSION | REQUEST
+ttl_ms / priority / pin_until
 ```
 
-UMBP 可以复用 LMCache 的 key 设计思想，但不是复用 LMCache 的 `CacheEngineKey` 类。具体做法是在 adapter 中生成 canonical key，把 token chunk hash、模型信息、租户/会话隔离信息和语义 phase 编码进去；UMBP 只把它当作 opaque string key 来索引、路由和读写 KV。
+UMBP 不需要理解这些字段。Adapter 用它们生成 canonical key，例如：
 
 ```text
-cache_key = hash(
-  model_id,
-  tokenizer_id,
-  kv_layout_version,
-  token_chunk_hash,
-  tenant_id,
-  agent_id or workflow_id,
-  reuse_scope,
-  phase
-)
+cache_key = hash(model_id, tokenizer_id, kv_layout_version,
+                 token_chunk_hash, tenant_id, agent_id/workflow_id,
+                 reuse_scope, phase)
 ```
 
-这个 key 不能只包含 token hash。否则不同租户共享相同系统提示词时，可能发生不期望的跨域复用。如果 `reuse_scope = GLOBAL`，可以有意去掉 `tenant_id`，但这必须是显式授权，而不是默认行为。
+这里的关键点是：**key 不能只包含 token hash**。两个租户可能有相同系统提示词，但这不代表它们的 KV 可以互相复用。只有当 `reuse_scope = GLOBAL` 且明确授权时，才可以去掉 `tenant_id`。
 
 ### 7.3 如果上游不产生语义怎么办
 
-现实里，很多 Agent Orchestrator、SGLang 或 vLLM 集成不会直接输出 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`PARTIAL_PREFILL` 这样的语义 hint。这时不要让 UMBP core 去猜 prompt 含义，而应让 adapter 退化为“弱语义”模式。
+很多 Agent Orchestrator、SGLang 或 vLLM 集成不会直接输出 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`PARTIAL_PREFILL` 这样的 hint。这时方案仍然可以工作，只是先进入“弱语义”模式。
 
-弱语义模式可以从三类信息推导 hints：
+弱语义模式的规则可以很保守：
 
-- **请求结构**：Chat API 里的 `role=system/user/assistant/tool`、tool call event、RAG context 拼接位置，通常足够区分系统提示词、用户问题和工具结果。
-- **框架 metadata**：tenant、session、request id、model id、tokenizer id、KV layout version 等字段，可用于生成隔离 key，即使没有语义 phase 也能避免错误复用。
-- **保守默认策略**：无法判断语义时，把 phase 标为 `UNKNOWN`，只做短 TTL、session scope 或 external KV routing，不做高优先级 pin 和跨租户复用。
+- Chat API 有 `role=system/user/assistant/tool` 时，用 role 推导大致 phase。
+- 有 tenant、session、request id、model id 时，至少用这些字段生成隔离 key。
+- 实在判断不了时，把 phase 标成 `UNKNOWN`，只做短 TTL、session 内复用或 external KV routing。
 
-因此，没有显式 hint 并不意味着方案不可用，只是收益会分层：第一阶段仍能获得 cache key 隔离和 KV-aware routing；只有当上游或 adapter 能稳定识别 system prompt、tool output、partial prefill 时，才能进一步获得语义分层、语义驱逐和 partial prefill pin 的收益。
+也就是说，没有显式 hint 时，先拿到“不会错复用”和“尽量路由到已有 KV 节点”的收益；等 adapter 能稳定识别 system prompt、tool output、partial prefill 后，再做语义分层、语义驱逐和 partial prefill pin。
 
-### 7.4 如何使用 UMBP 现有能力
+### 7.4 接入 UMBP 的方式
 
-Adapter 使用 UMBP 时，可以先分成两条路径。
+接入可以分两步，先轻后重。
 
-**路径一：External KV metadata。**
+**第一步：只上报 external KV metadata。**
 
-KV bytes 仍在 SGLang/vLLM 自己的 host cache 或 HBM cache 中，adapter 只把 hash 和 tier 报给 UMBP master，走 `report_external_kv_blocks()` / `match_external_kv()`。这条路径适合先做 KV-aware routing，风险小，不改 UMBP 数据面。[M2][M5]
+KV bytes 仍在 SGLang/vLLM 自己的 cache 中，adapter 只把 hash、tier 和少量 metadata 报给 UMBP master，走 `report_external_kv_blocks()` / `match_external_kv()`。这样可以先做 KV-aware routing，风险小，也不改 UMBP 数据面。[M2][M5]
 
-**路径二：UMBP-owned KV。**
+**第二步：把高价值 KV 交给 UMBP 管。**
 
-KV bytes 由 UMBP 管理，adapter 通过 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()` 存取。内部会使用 `RoutePut`、peer `AllocateSlot`、RDMA 写入、`CommitSlot` 和 heartbeat `KvEvent` 进入 `GlobalBlockIndex`。[M2][M4]
+对系统提示词、高命中工具结果这类复用价值高的 KV，adapter 再通过 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()` 让 UMBP 直接保存和读取 KV bytes。[M2][M4]
 
-在写入策略上，可以先采用简单规则：
+策略可以先非常简单：
 
 | Phase | 写入策略 | 理由 |
 |---|---|---|
-| `SYSTEM_PROMPT` | 保存，优先 HBM/DRAM，可异步复制到 SSD | 长期复用价值最高 |
-| `USER_QUERY` | 保存到 DRAM，TTL 较短 | 可能在同一 session 的后续轮次复用 |
-| `TOOL_OUTPUT` | 保存到 DRAM/SSD，按 tool 类型和大小决定 | 大工具结果可能复用，但也可能污染 cache |
-| `RESPONSE` | 默认不保存，或只短 TTL 保存 | 多数最终回答复用价值低 |
-| `PARTIAL_PREFILL` | 保存并临时 pin，事件完成后降级 | 工具执行期间最需要保护 |
+| `SYSTEM_PROMPT` | 保存，优先 HBM/DRAM，可异步复制到 SSD | 最容易被多次复用 |
+| `USER_QUERY` | 短 TTL，只在 session 内复用 | 通常只对本轮或后续几轮有用 |
+| `TOOL_OUTPUT` | 按大小和命中率决定是否保存 | 常用工具结果有价值，一次性大结果可能污染 cache |
+| `RESPONSE` | 默认不保存 | 最终回答通常复用价值低 |
+| `PARTIAL_PREFILL` | 临时 pin，事件结束后降级 | 工具执行期间最需要保护 |
 
-读取和路由也由 adapter 编排：请求进入 router 前，adapter 可以用 prompt chunk hashes 调用 `match_external_kv()` 找 cache-local 节点；如果 KV bytes 已经由 UMBP 管理，再调用 `batch_get_into_ptr()` 把缺失 chunk 加载回来。UMBP 的 `RouteGet` 仍按 HBM > DRAM > SSD 选择最快 tier，并用 lease 保护读取过程。[M2][M4][M5]
+落地顺序建议是：先做语义 key 和 external KV routing；确认有收益后，再把高价值 KV 接入 UMBP-owned KV；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
 
-如果后续要做语义驱逐，可以把 eviction score 从单纯 LRU 扩展为：
-
-```text
-eviction_score =
-  semantic_priority_weight
-  + tier_pressure_weight
-  + recency_weight
-  + hit_count_weight
-  + size_penalty
-  + lease_or_pin_guard
-```
-
-实现上不应让 master 直接管理每个 token span 的复杂状态。更合适的是由 adapter/peer 提供轻量 metadata summary，例如 `phase`、`priority`、`ttl`、`reuse_scope`；master 只保存驱逐和路由需要的字段。peer 仍然是最终 owner。
-
-### 7.5 UMBP 能承接什么，不能承接什么
-
-UMBP 已经具备很多底层能力，但 LMCache 的高层语义不能直接等同于 UMBP 现有功能：
-
-| 需求 | UMBP 现有能力 | 需要 adapter / 策略层补齐 |
-|---|---|---|
-| 分层存储 | HBM/DRAM/SSD tier，SSD copy-on-commit，peer-local SSD LRU | 语义到 tier policy 的映射 |
-| 外部 KV 匹配 | `ExternalKvBlockIndex`、`match_external_kv()`、hit count | 按 phase/session/tenant 聚合和打分 |
-| KV 读写 | `put_from_ptr` / `get_into_ptr`，`batch_put_from_ptr` / `batch_get_into_ptr` | page layout、模型信息、KV layout version 的 key 规范 |
-| 读取保护 | `RouteGet` grant lease、peer read lease、SSD lease | partial prefill 级别的 pin 事件 |
-| 租户隔离 | key namespace、SPDK proxy tenant id、client tags | `cache_salt` / `lmcache.tag.*` 类高层语义 |
-| 跳过保存 | 无同名机制 | adapter 不调用 UMBP put/report |
-| 压缩迁移 | 没有 LMCache 式 `compress/decompress` / `move` | 如需要，应作为独立策略或上层能力设计 |
-
-因此，更准确的说法是：UMBP 可以承接 LMCache 思路中的“分层存储、外部 KV 读写、路由索引和缓存隔离”；`cache_salt`、tag、skip-save、semantic policy 等高层语义应放在 adapter 中实现。
-
-### 7.6 建议分阶段落地
-
-**阶段 1：只做语义 key 和 external KV routing。**
-
-在 SGLang/vLLM adapter 中生成 `SemanticKvHint`，把 `SYSTEM_PROMPT`、`TOOL_OUTPUT` 等 phase 进入 cache key namespace；KV bytes 仍由引擎持有，只通过 `report_external_kv_blocks()` 上报 hash 到 UMBP master。router 根据 `match_external_kv()` 结果做节点亲和。
-
-如果暂时不改 master 数据结构，可以把 `SYSTEM_PROMPT` 等稳定前缀映射为更大的 prefix depth，复用现有 prefix-aware LRU；但这只是位置/链路深度信号，不等价于真正的 `SYSTEM_PROMPT` 语义枚举。
-
-**阶段 2：把高价值前缀接入 UMBP-owned KV。**
-
-把 `SYSTEM_PROMPT` 和高命中 `TOOL_OUTPUT` 的 KV page 通过 `batch_put_from_ptr()` 写入 UMBP。读取时用 `batch_get_into_ptr()` 恢复到引擎 KV buffer。这个阶段重点验证 page layout、dtype、model id、tokenizer id、kv layout version 是否都进入 key。
-
-**阶段 3：语义驱逐。**
-
-扩展 UMBP metadata，让 `GlobalBlockIndex` 或 eviction candidate 携带 semantic priority、TTL、hit count。先只影响 HBM/DRAM eviction 排序，不改变 SSD peer-local LRU，避免一次性改动过大。
-
-**阶段 4：partial prefill pin。**
-
-当 Agent 发起工具调用时，adapter 把工具无关前缀标为 `PARTIAL_PREFILL` 并 pin；工具结果返回并完成 `extend_prefill` 后，把它降级为 `TOOL_OUTPUT` 或 `USER_QUERY`。这一步最接近 Sutradhara，但需要推理引擎 scheduler 配合，不能只靠 UMBP 完成。
-
-### 7.7 风险与边界
-
-- **UMBP 不应负责解析 prompt。** 语义识别应由 Agent orchestrator 或推理框架 adapter 完成。
-- **Semantic KV Adapter 是可选增强层，不是 UMBP core 的一部分。** 没有 hint producer 时，UMBP 仍然按 opaque key 做普通 KV block pool；它不会自动获得语义感知路由、语义分层或语义驱逐收益。
-- **不要默认跨租户复用。** 只有明确 `reuse_scope = GLOBAL` 的 KV 才能跨 tenant。
-- **master 不应变成强一致目录。** 语义 metadata 要保持轻量、异步、可重建，符合 master-as-advisor 设计。
-- **client tags 不是现成路由策略。** 当前更接近注册/metrics 标签；要用于语义路由，需要扩展 routing strategy。
-- **partial prefill 不是纯 cache 功能。** 它需要引擎能提前 prefill、暂停、扩展上下文；UMBP 只能提供 KV 存储、pin 和跨节点搬运。
-- **SSD 适合兜底，不适合热路径默认读取。** UMBP 当前 `RouteGet` 已按 HBM > DRAM > SSD 选择 tier，语义策略应顺着这个模型，而不是让高频请求频繁走 SSD。
-
-### 7.8 一个具体例子
+### 7.5 一个具体例子
 
 假设一个企业报表 Agent 的请求结构是：
 
@@ -703,6 +616,8 @@ UMBP Semantic KV Adapter 可以这样处理：
 - `PARTIAL_PREFILL` 在 SQL 执行期间 pin，工具结果回来后解除 pin。
 - `RESPONSE` 默认 skip-save，避免污染 HBM/DRAM。
 - 下一次同一 tenant 的报表 Agent 请求进来时，router 先通过 external KV match 找到已有系统提示词 KV 的节点，再由 UMBP `RouteGet` 从 HBM/DRAM 读取缺失 chunk；如果热层被驱逐但 SSD 还有副本，则从 SSD 回填。
+
+这个例子的重点不是让 UMBP 理解“报表”或“SQL”的业务含义，而是让 adapter 把这些信息变成简单的缓存策略：系统提示词更值得保留，用户问题只在会话内短期保留，最终回答默认不保存。
 
 这样得到的系统形态可以概括为：Sutradhara 负责“知道什么重要”，LMCache 思路负责“把 tags 变成 cache identity 和生命周期”，UMBP 负责“把 KV bytes 放在合适的节点和 tier，并高速搬运”。
 
