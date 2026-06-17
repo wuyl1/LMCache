@@ -689,6 +689,18 @@ RESPONSE:       最终中文报告
 
 这样得到的系统形态可以概括为：Sutradhara 负责“知道什么重要”，LMCache 思路负责“把 tags 变成 cache identity 和生命周期”，UMBP 负责“把 KV bytes 放在合适的节点和 tier，并高速搬运”。
 
+### 7.6 小结：Adapter 的职责和收益
+
+Semantic KV Adapter 的核心职责不是替代 UMBP，而是把 Agent/推理框架里的上下文翻译成 UMBP 可以安全消费的 key、metadata 和 API 调用。具体来说，adapter 需要做五件事：
+
+- **生成正确 key**：按 token chunk、model、tokenizer、KV layout、tenant/session 和 phase 生成标准化 cache key，保证能复用的 KV 才会命中。
+- **生成 hint**：优先读取上游已有字段，例如 message role、tool event、workflow metadata 和 `cacheable` 标记；缺失时再按简单规则补默认值，例如 `role=system` 对应 `SYSTEM_PROMPT`，`USER_QUERY` 默认短 TTL，`RESPONSE` 默认 skip-save。这里的“推导”不是复杂业务理解，而是规则映射和默认值填充。
+- **选择接入路径**：低风险阶段只 report external KV metadata；高价值 KV 再走 UMBP-owned put/get。
+- **控制保存策略**：优先保留 `SYSTEM_PROMPT`，谨慎处理大 `TOOL_OUTPUT`，默认跳过 `RESPONSE`。
+- **提供轻量策略信号**：把 priority、TTL、pin 等信息传给 UMBP 的路由、分层和回收路径，但不要求 UMBP core 理解业务语义。
+
+预期收益也应分阶段看。metadata-only 阶段主要提升 routing 质量：请求更容易被送到已有 KV 的节点，减少重复 prefill，同时避免低价值 KV 污染 external KV index。UMBP-owned 阶段进一步带来跨节点 KV 复用和分层存储收益：高价值 KV 可以由 UMBP 托管，从 HBM/DRAM/SSD 中按最快可用 tier 取回。后续如果 UMBP 消费 adapter 提供的 `phase / priority / ttl`，还能减少 cache 污染，让系统提示词这类高复用 KV 比低命中工具结果更晚被回收。
+
 ---
 
 ## 8. 最终结论
