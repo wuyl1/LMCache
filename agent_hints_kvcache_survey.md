@@ -514,12 +514,12 @@ RESPONSE           优先驱逐
 
 UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD，不同节点之间查找和搬运 KV，并通过 master 给读写请求做路由建议。[M1][M2][M3][M4][M5][M6] 但它不应该判断某段 token 是系统提示词、用户问题、工具结果，还是最终回答。语义判断、key 生成和策略选择放在 adapter；UMBP 继续按 opaque key、tier 和轻量 metadata 执行存取。
 
-本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。它们按 adapter 的处理流程展开：先识别语义，再生成生命周期 hint，随后生成可复用的 key，最后用隔离字段和 skip-save 收紧复用与保存范围。
+本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。它们按 adapter 的处理流程展开：先识别语义，再生成生命周期 hint，随后生成可复用的 key，最后决定哪些 KV 值得进入缓存系统。
 
 1. **Sutradhara 式语义 phase 标签**：先把上游上下文映射成 `SYSTEM_PROMPT / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN`。
 2. **Sutradhara 式 priority / event-based pin**：紧接 phase，把语义阶段转成 TTL、priority 和临时 pin 策略。
 3. **LMCache 式 chunk/prefix key 管理**：保证同一段 token KV 能稳定命中，不该复用的 KV 不会误命中。
-4. **LMCache 式隔离与 skip-save**：用 tenant/session/reuse scope 控制复用边界，对低价值内容跳过保存。
+4. **Admission 与 skip-save 控制**：决定哪些 KV 只做短期本地使用、哪些可以上报 external index、哪些值得交给 UMBP 托管。
 
 ### 7.1 职责边界
 
@@ -644,29 +644,31 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 - **语义边界和 chunk 边界不一定完全一致。** Adapter 应尽量在语义边界切 chunk；如果一个 chunk 同时包含 system prompt 末尾和 user query 开头，应使用更保守的 phase，例如 `UNKNOWN` 或较低 priority，避免把混合 chunk 当成长期 `SYSTEM_PROMPT` 保存。
 - **`RESPONSE` 不是默认要保存的 prefill 前缀。** 在线 decode 产生的最终回答默认 skip-save；只有当它在下一轮对话中作为 history 重新进入 prompt 时，adapter 才按新的 prompt span 重新切分和标注。
 
-### 7.5 功能四：隔离与 skip-save
+### 7.5 功能四：admission 与 skip-save 控制
 
-第四个功能是控制“哪些 KV 可以复用”和“哪些 KV 根本不该保存”。这部分借鉴 LMCache 的 `cache_salt`、tag isolation 和 `skip_save` 思路，但落在 UMBP adapter 的 key 和策略上。
+第四个功能不是再次定义复用边界，而是做缓存准入控制。功能三已经通过 canonical key 解决“能不能安全复用”；功能四回答另一个问题：即使一段 KV 可以被正确命名，它是否值得 report、put，或进入 UMBP-owned 路径。
 
-Adapter 可以使用这些字段控制复用边界。这些字段既可以进入 canonical key，也可以作为 metadata 参与匹配和策略判断：
+Adapter 可以把每个 chunk 分成三类：
 
-- `tenant_id`：默认隔离不同租户。
-- `session_id`：限制多轮对话内的短期复用。
-- `agent_id / workflow_id`：区分不同 Agent 或业务流程。
-- `reuse_scope`：显式指定 `GLOBAL / TENANT / AGENT / SESSION / REQUEST` 的复用范围。
+```text
+skip        # 不 report、不 put，只让推理引擎本地按请求生命周期处理
+report      # 只上报 metadata，用于后续 match_external_kv() 和路由
+put         # 把 KV bytes 交给 UMBP 托管，用于跨节点、跨 tier 复用
+```
 
-保存策略也应保守：
+准入策略应保守：
 
-- `SYSTEM_PROMPT` 在 key 维度完整且 scope 合法时默认保存。
-- `USER_QUERY` 默认短 TTL，只在 session 内复用。
-- `RESPONSE` 默认 skip-save，不 report、不 put。
-- 大型低命中 `TOOL_OUTPUT` 默认降低优先级或跳过保存，避免污染 HBM/DRAM。
+- `SYSTEM_PROMPT` 在 key 维度完整且 scope 合法时，默认至少 report；如果命中率高，可以进入 UMBP-owned `put` 路径。
+- `USER_QUERY` 默认短 TTL，通常只在 session 内 report，不做长期 UMBP-owned 托管。
+- `TOOL_OUTPUT` 需要结合大小、`cacheable` hint、工具类型和历史命中统计；信号不足时只 report 或直接 skip。
+- `RESPONSE` 默认 skip-save，不 report、不 put；如果它下一轮作为对话历史重新进入 prompt，再按新的 prompt span 处理。
+- `UNKNOWN` 或混合 chunk 默认 skip 或短 TTL report，避免污染 external KV index、HBM 和 DRAM。
 
-如果上游没有显式 hint，也没有配置规则或命中统计，adapter 就走保守默认：只做隔离 key 和短 TTL，不做跨租户复用，也不把大对象长期放进热层。这样至少能拿到“不会错复用”和“尽量路由到已有 KV 节点”的收益。
+这样功能四聚焦“是否进入缓存系统”，而不是重复功能三的 key 隔离。即使上游没有显式 hint，adapter 也可以用保守准入策略避免低价值 KV 占用热层，同时保留 metadata-only routing 带来的低风险收益。
 
 ### 7.6 Adapter 如何接入 UMBP
 
-完成前四个功能后，adapter 已经有了 canonical key、policy hints、隔离范围和 skip-save 决策。接下来并不是一定要把所有 KV bytes 都交给 UMBP；它可以选择两种接入深度：**只让 UMBP 知道 KV 在哪里**，或 **让 UMBP 真正保存 KV bytes**。
+完成前四个功能后，adapter 已经有了 canonical key、policy hints 和 admission 决策。接下来并不是一定要把所有 KV bytes 都交给 UMBP；它可以选择两种接入深度：**只让 UMBP 知道 KV 在哪里**，或 **让 UMBP 真正保存 KV bytes**。
 
 **方式一：metadata-only 接入，用 UMBP 做路由索引。**
 
@@ -716,7 +718,7 @@ RESPONSE:       最终中文报告
 
 - 对公司统一分析规范这 3K tokens，adapter 识别为 `SYSTEM_PROMPT`。在 chunk 边界、model、tokenizer、KV layout、tenant/reuse scope 都匹配的前提下，它用 `tenant_id + agent_id + model_id + token_hash + phase` 生成稳定 key，并把策略设为“高优先级保存、优先 HBM/DRAM、必要时 SSD 兜底”。原因是同一个企业报表 Agent 后续很多请求都会复用这段规范。
 - 对“分析华东区 Q2 销售异常”这句用户问题，adapter 识别为 `USER_QUERY`。它把 key 绑定到 `session_id`，设置短 TTL。原因是这段内容通常只对当前会话的后续几轮有用，不应该变成跨会话长期缓存。
-- 对 20K tokens 的 SQL 查询结果，adapter 识别为 `TOOL_OUTPUT`。它不会凭空知道这个 SQL 是否“常用”，而是看上游是否带了 `tool_name / workflow_id / cacheable` 之类的 hint，或者看配置规则和历史命中统计。信号足够时可以保存；信号不足时就降低优先级或跳过保存。原因是大工具结果很容易挤占 HBM/DRAM。
+- 对 20K tokens 的 SQL 查询结果，adapter 识别为 `TOOL_OUTPUT`。它不会凭空知道这个 SQL 是否“常用”，而是看上游是否带了 `tool_name / workflow_id / cacheable` 之类的 hint，或者看配置规则和历史命中统计。信号足够时可以 report 或 put；信号不足时就降低优先级或 skip。原因是大工具结果很容易挤占 HBM/DRAM。
 - 对等待 SQL 时已经 prefill 的工具无关上下文，adapter 识别为 `PARTIAL_PREFILL`，在工具返回前临时 pin。原因是这部分如果被驱逐，工具返回后还要重复 prefill。
 - 对在线 decode 产生的最终中文报告，adapter 识别为 `RESPONSE`，默认 skip-save。原因是最终回答很少作为后续请求的稳定前缀；如果它下一轮作为对话历史重新进入 prompt，再按新的 prompt span 处理。
 
@@ -725,7 +727,7 @@ RESPONSE:       最终中文报告
 到 UMBP 这一层时，业务语义已经被 adapter 翻译成 key、API 调用、tier policy 和轻量 metadata。UMBP 不再判断“报表规范是否重要”，只按这些输入执行：
 
 1. **系统提示词先用于路由。** 如果某个 worker 已经有“公司统一分析规范”的 KV，adapter 上报这段 `SYSTEM_PROMPT` 的 hash、节点和 tier。下一次同一 tenant 的报表请求进来时，adapter 调 `match_external_kv()`；UMBP master 返回可能命中的节点，router 优先把请求送过去，减少重复 prefill。
-2. **高价值内容再写入 UMBP。** 对 `SYSTEM_PROMPT`，adapter 可以按默认规则认为它复用价值高；对 `TOOL_OUTPUT`，adapter 需要依据上游 hint、配置规则或历史命中统计判断是否值得保存。确认值得托管后，adapter 调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择 peer；peer 在 HBM/DRAM/SSD 中分配空间，真正保存 KV bytes。
+2. **高价值内容再写入 UMBP。** 对 `SYSTEM_PROMPT`，adapter 可以按默认规则认为它复用价值高；对 `TOOL_OUTPUT`，adapter 需要依据上游 hint、配置规则或历史命中统计做 admission 判断。确认值得托管后，adapter 调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择 peer；peer 在 HBM/DRAM/SSD 中分配空间，真正保存 KV bytes。
 3. **后续请求按 key 取回缺失 chunk。** 当新请求只缺少部分 KV chunk 时，adapter 调 `batch_get_into_ptr()`。UMBP master 用 `RouteGet` 查 `GlobalBlockIndex`，优先从 HBM/DRAM 返回；如果热层没有但 SSD 有副本，再从 SSD 回填。
 4. **缓存压力下按 hint 排序。** HBM/DRAM 空间紧张时，UMBP 不理解“报表规范”这个业务含义，但可以使用 adapter 给出的 `phase / priority / ttl` 作为排序信号：`SYSTEM_PROMPT` 尽量保留，低命中 `TOOL_OUTPUT` 下沉或驱逐，`RESPONSE` 因为 skip-save 不占 cache。
 
@@ -739,8 +741,8 @@ Semantic KV Adapter 的核心职责不是替代 UMBP，而是把 Agent/推理框
 
 - **生成语义 phase hint**：优先读取上游已有字段，例如 message role、tool event、workflow metadata 和 `cacheable` 标记；缺失时按简单规则补默认值，例如 `role=system` 对应 `SYSTEM_PROMPT`。这里不是复杂业务理解，而是规则映射和默认值填充。
 - **提供 priority / pin 信号**：基于 phase 生成 priority 和 TTL；对 event-based pin，则优先消费上层 Agent / orchestrator 提供的事件边界，缺失时退化为 TTL-based 临时保护。
-- **生成正确 key**：按 token chunk、model、tokenizer、KV layout、tenant/session 和 phase 生成标准化 cache key，保证能复用的 KV 才会命中。
-- **控制复用边界和 skip-save**：用 `tenant_id / session_id / reuse_scope` 控制匹配范围；对 `RESPONSE` 和低价值大对象默认不 report、不 put。
+- **生成正确 key**：按 token chunk、model、tokenizer、KV layout、tenant/session、reuse scope 和 phase 生成标准化 cache key，保证能复用的 KV 才会命中。
+- **执行 admission / skip-save 控制**：根据 phase、priority、TTL、大小和命中统计决定 skip、report 还是 put，避免低价值 KV 污染 external KV index 和热层缓存。
 
 预期收益也应分阶段看。metadata-only 阶段主要提升 routing 质量：请求更容易被送到已有 KV 的节点，减少重复 prefill，同时避免低价值 KV 污染 external KV index。UMBP-owned 阶段进一步带来跨节点 KV 复用和分层存储收益：高价值 KV 可以由 UMBP 托管，从 HBM/DRAM/SSD 中按最快可用 tier 取回。后续如果 UMBP 消费 adapter 提供的 `phase / priority / ttl`，还能减少 cache 污染，让系统提示词这类高复用 KV 比低命中工具结果更晚被回收。
 
