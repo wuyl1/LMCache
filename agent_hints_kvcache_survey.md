@@ -514,7 +514,7 @@ RESPONSE           优先驱逐
 
 UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD，不同节点之间查找和搬运 KV，并通过 master 给读写请求做路由建议。[M1][M2][M3][M4][M5][M6] 但它不应该判断某段 token 是系统提示词、用户问题、工具结果，还是最终回答。语义判断、key 生成和策略选择放在 adapter；UMBP 继续按 opaque key、tier 和轻量 metadata 执行存取。
 
-本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。这四个功能分别来自 LMCache 和 Sutradhara 的核心启发：
+本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。它们按 adapter 的处理流程展开：先识别语义，再生成生命周期 hint，随后生成可复用的 key，最后用隔离字段和 skip-save 收紧复用与保存范围。
 
 1. **Sutradhara 式语义 phase 标签**：先把上游上下文映射成 `SYSTEM_PROMPT / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN`。
 2. **Sutradhara 式 priority / event-based pin**：紧接 phase，把语义阶段转成 TTL、priority 和临时 pin 策略。
@@ -535,10 +535,10 @@ Agent Orchestrator / SGLang / vLLM
 UMBP Semantic KV Adapter
         │
         │  翻译结果：
-        │  - system message -> phase=SYSTEM_PROMPT，生成稳定 token chunk key
+        │  - system message -> semantic span + 高 priority hint
         │  - SQL result     -> phase=TOOL_OUTPUT，按大小/命中率决定是否保存
         │  - final answer   -> phase=RESPONSE，默认 skip-save
-        │  - 输出给 UMBP: key + metadata + put/report/skip 决策
+        │  - 输出给 UMBP: canonical key + metadata + put/report/skip 决策
         ▼
 MORI-UMBP
         │
@@ -550,10 +550,10 @@ MORI-UMBP
 
 这个边界有两层含义：
 
-- **Adapter 负责翻译。** 它看 message role、tool event、session metadata 和 token span，把这些信息转成标准化 key、保存策略和 UMBP API 调用。
+- **Adapter 负责翻译。** 它看 message role、tool event、session metadata 和 token span，把这些信息转成 semantic spans、标准化 key、保存策略和 UMBP API 调用。
 - **UMBP 负责执行。** 它不解析 prompt，不判断语义，只按照 key、tier 和轻量 metadata 做路由、读写和回收。
 
-UMBP master 和 peer 的关系也可以简单理解：master 像“问路台”，peer 像“仓库”。master 通过 heartbeat 维护一个近似的 `GlobalBlockIndex`，告诉请求应该去哪个 peer；真正保存、读取和释放 KV block 的是 peer。[M2] 因此语义 metadata 也应该轻量、异步上报，不能让每个 token span 更新都同步写 master。
+UMBP master 和 peer 的关系可以理解为“路由建议”和“数据持有”的分工。master 通过 heartbeat 维护一个近似的 `GlobalBlockIndex`，为读写请求选择候选 peer；真正保存、读取和释放 KV block 的是 peer。[M2] 因此 adapter 上报给 master 的语义 metadata 应保持轻量，并尽量异步批量更新，不能让每个 token span 变化都变成同步 master 写入。
 
 ### 7.2 功能一：Sutradhara 式语义 phase 标签
 
@@ -565,13 +565,13 @@ USER_QUERY        # 当前请求或当前 session 的短期内容
 TOOL_OUTPUT       # 工具结果，是否保存取决于大小、cacheable hint 和命中统计
 PARTIAL_PREFILL   # 工具等待期间的临时关键前缀
 RESPONSE          # 在线 decode 产生的最终回答，默认 skip-save
-UNKNOWN           # 无法可靠判断的混合或未知内容
+UNKNOWN           # 无法可靠判断的内容
 ```
 
 phase 的来源可以分两类：
 
 - **直接读取**：Chat API 的 `role=system/user/assistant/tool`、tool event、workflow metadata、`cacheable` 标记。
-- **规则映射**：例如 `role=system` 映射为 `SYSTEM_PROMPT`，assistant response 默认映射为 `RESPONSE`，无法判断的混合 chunk 映射为 `UNKNOWN`。
+- **规则映射**：例如 `role=system` 映射为 `SYSTEM_PROMPT`，assistant response 默认映射为 `RESPONSE`，无法判断的 span 映射为 `UNKNOWN`。
 
 这不是复杂业务理解，而是规则映射和默认值填充。phase 的作用也很明确：影响保存、上报、TTL、priority、pin，但不能替代 token chunk key。
 
@@ -583,11 +583,11 @@ phase 的来源可以分两类：
 (token_start=3120, token_end=23500, phase=TOOL_OUTPUT,   source=tool_event)
 ```
 
-这些 span 后续会在 key 管理阶段映射到推理引擎的 KV block / page chunk 上。如果语义边界和 chunk 边界不一致，adapter 应使用更保守的 phase，例如 `UNKNOWN` 或较低 priority，避免把混合 chunk 当成长期稳定内容保存。
+这些 span 后续会在 key 管理阶段映射到推理引擎的 KV block / page chunk 上。功能一只负责给 token 区间打语义标签，不负责证明 KV bytes 可以复用；复用正确性仍由功能三的 chunk/key 管理保证。
 
 ### 7.3 功能二：priority 与 event-based pin
 
-第二个功能是把 phase 进一步转成生命周期和调度 hint。它和功能一强绑定：phase 回答“这段 KV 是什么”，priority / pin 回答“这段 KV 应该怎么被保存、保护和回收”。Adapter 可以生成：
+第二个功能是把 phase 进一步转成生命周期和调度 hint。它和功能一强绑定：phase 回答“这段 KV 是什么”，priority / pin 回答“这段 KV 应该怎样被保存、保护和回收”。Adapter 可以生成：
 
 ```text
 ttl_ms      # 多久后可以回收
@@ -609,7 +609,7 @@ pin_until   # 临时保护到某个事件完成
 
 ### 7.4 功能三：LMCache 式 key 管理
 
-第三个功能是复用正确性。语义标签和 priority 只能说明“这段 KV 是否重要”，不能证明两次请求的 KV 可以复用。真正决定能否复用的，是 token chunk、模型、tokenizer 和 KV layout 是否一致。因此 adapter 要实现类似 LMCache 的 chunk/prefix key 管理。
+第三个功能是保证复用正确性。phase 和 priority 只能说明“这段 KV 是否重要”，不能证明两次请求的 KV 可以复用。真正决定能否复用的，是 token chunk、模型、tokenizer 和 KV layout 是否一致。因此 adapter 要实现类似 LMCache 的 chunk/prefix key 管理。
 
 Adapter 可以按推理引擎 connector 的 KV block / page 粒度切分 token chunk，并为每个 chunk 生成标准化 cache key：
 
@@ -619,7 +619,7 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
                  reuse_scope, phase)
 ```
 
-这个 key 是 adapter 和 UMBP 之间的 KV 身份标识，作用有三种：
+这个标准化 key 也可以称为 canonical key，是 adapter 和 UMBP 之间的 KV 身份标识，作用有三种：
 
 - **external KV report/match**：adapter 用 key 上报“这个 KV chunk 在哪个 worker、哪个 tier”；下一次请求生成同一个 key 后，用 `match_external_kv()` 找已有 KV 的节点。
 - **UMBP-owned put/get**：adapter 用 key 调 `batch_put_from_ptr()` 保存 KV bytes；后续请求生成同一个 key 后，用 `batch_get_into_ptr()` 取回 KV bytes。
@@ -648,7 +648,7 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 
 第四个功能是控制“哪些 KV 可以复用”和“哪些 KV 根本不该保存”。这部分借鉴 LMCache 的 `cache_salt`、tag isolation 和 `skip_save` 思路，但落在 UMBP adapter 的 key 和策略上。
 
-Adapter 可以使用这些字段控制复用边界：
+Adapter 可以使用这些字段控制复用边界。这些字段既可以进入 canonical key，也可以作为 metadata 参与匹配和策略判断：
 
 - `tenant_id`：默认隔离不同租户。
 - `session_id`：限制多轮对话内的短期复用。
@@ -666,7 +666,7 @@ Adapter 可以使用这些字段控制复用边界：
 
 ### 7.6 Adapter 如何接入 UMBP
 
-Adapter 拿到 key 和 hint 后，并不是一定要把所有 KV bytes 都交给 UMBP。它可以选择两种接入深度：**只让 UMBP 知道 KV 在哪里**，或 **让 UMBP 真正保存 KV bytes**。
+完成前四个功能后，adapter 已经有了 canonical key、policy hints、隔离范围和 skip-save 决策。接下来并不是一定要把所有 KV bytes 都交给 UMBP；它可以选择两种接入深度：**只让 UMBP 知道 KV 在哪里**，或 **让 UMBP 真正保存 KV bytes**。
 
 **方式一：metadata-only 接入，用 UMBP 做路由索引。**
 
@@ -694,7 +694,7 @@ KV bytes 仍然放在 SGLang/vLLM 自己的 cache 里。Adapter 只把 hash、ti
 
 代价是 adapter 必须正确处理 page layout、dtype、model id、tokenizer id 和 KV layout version，否则不同模型或不同 KV layout 的 bytes 可能被错误复用。因此这条路径更适合作为第二阶段，在 metadata-only routing 验证收益后再接入。
 
-因此，推荐落地顺序是：adapter 先做语义 key 和 metadata-only routing；确认路由收益后，再把少量高价值 KV 接入 UMBP-owned 路径；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
+因此，推荐落地顺序是：adapter 先生成 semantic spans、policy hints 和 canonical key，并用于 metadata-only routing；确认路由收益后，再把少量高价值 KV 接入 UMBP-owned 路径；最后再让 UMBP core 更深入地消费 priority、TTL 和 pin hint。这样每一步都能独立验证，不需要一次性改 UMBP core。
 
 ### 7.7 端到端例子
 
@@ -731,7 +731,7 @@ RESPONSE:       最终中文报告
 
 这个例子的重点不是让 UMBP 理解“报表”或“SQL”的业务含义，而是让 adapter 把这些业务上下文变成正确 key 和可执行策略：系统提示词稳定复用，所以尽量保留；用户问题只在会话内短期保留；工具结果要看是否常用；最终回答默认不保存。
 
-这样得到的系统形态可以概括为：Sutradhara 负责“知道什么重要”，LMCache 思路负责“把 tags 变成 cache identity 和生命周期”，UMBP 负责“把 KV bytes 放在合适的节点和 tier，并高速搬运”。
+这样得到的系统形态可以概括为：Sutradhara 式 hint 提供语义 phase 和事件边界，LMCache 式 key 管理提供 cache identity 与隔离规则，UMBP 负责按 opaque key 和轻量 metadata 做路由、存储与跨 tier 搬运。
 
 ### 7.8 小结：Adapter 的职责和收益
 
