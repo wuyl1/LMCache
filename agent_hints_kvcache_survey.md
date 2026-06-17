@@ -616,17 +616,7 @@ KV bytes 仍在 SGLang/vLLM 自己的 cache 中，adapter 只把 hash、tier 和
 
 对系统提示词、高命中工具结果这类复用价值高的 KV，adapter 再通过 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()` 让 UMBP 直接保存和读取 KV bytes。[M2][M4]
 
-策略可以先非常简单：
-
-| Phase | 写入策略 | 理由 |
-|---|---|---|
-| `SYSTEM_PROMPT` | 保存，优先 HBM/DRAM，可异步复制到 SSD | 最容易被多次复用 |
-| `USER_QUERY` | 短 TTL，只在 session 内复用 | 通常只对本轮或后续几轮有用 |
-| `TOOL_OUTPUT` | 按大小和命中率决定是否保存 | 常用工具结果有价值，一次性大结果可能污染 cache |
-| `RESPONSE` | 默认不保存 | 最终回答通常复用价值低 |
-| `PARTIAL_PREFILL` | 临时 pin，事件结束后降级 | 工具执行期间最需要保护 |
-
-落地顺序建议是：先做语义 key 和 external KV routing；确认有收益后，再把高价值 KV 接入 UMBP-owned KV；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
+具体哪些 KV 值得保存、保存多久、放在哪个 tier，由 adapter 根据 hint 和配置决定。落地顺序建议是：先做语义 key 和 external KV routing；确认有收益后，再把高价值 KV 接入 UMBP-owned KV；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
 
 ### 7.5 一个具体例子
 
@@ -644,24 +634,33 @@ RESPONSE:       最终中文报告
 
 **第一层：Agent / 推理框架提供上下文。**
 
-上游不需要懂 UMBP，只要保留请求结构即可：system message 是公司统一规范，user message 是本次问题，tool event 是 SQL 查询结果，metadata 里有 `tenant_id / agent_id / session_id / model_id`。这些信息本来就存在于 Agent runtime 或推理框架 adapter 中，区别只是以前没有传给 KV cache 策略使用。
+上游不需要懂 UMBP，只要保留请求结构即可：system message 是公司统一规范，user message 是本次问题，tool event 是 SQL 查询结果，metadata 里有 `tenant_id / agent_id / session_id / model_id`。这些信息本来就存在于 Agent runtime 或推理框架 adapter 中，区别只是以前没有传给 KV cache 策略使用。这一层只提供事实，不决定 KV 该不该保存。
 
 **第二层：Semantic KV Adapter 把每段上下文翻译成缓存决策。**
 
-Adapter 不只是笼统地“生成 hint”，而是把上面的请求逐段处理：
+Adapter 先套用一组简单、可配置的规则，再把规则应用到这次报表请求上。这里的策略不要求 adapter 理解业务语义，而是用明确字段做判断：
+
+- **按 `phase` 设默认动作**：`SYSTEM_PROMPT` 默认保存，`RESPONSE` 默认 skip-save，`USER_QUERY` 默认短 TTL。
+- **按 `reuse_scope` 控制复用范围**：`SESSION` 只在当前会话复用，`TENANT` 只在同一租户复用，只有显式 `GLOBAL` 才允许跨租户复用。
+- **按大小和命中统计处理 `TOOL_OUTPUT`**：小且高命中的工具结果可以保存；过大、低命中或没有 cacheable hint 的结果降低优先级或跳过。
+- **按 `ttl_ms / priority / pin_until` 控制生命周期**：这些字段可以由编排器显式提供，也可以由 adapter 根据 `phase` 和配置推导默认值。例如 `USER_QUERY` 默认短 TTL，`SYSTEM_PROMPT` 默认高 priority，`PARTIAL_PREFILL` 的 `pin_until` 可以绑定到“工具调用返回”这个事件。
+
+如果上游没有显式 hint，也没有配置规则或命中统计，adapter 就走保守默认：只做隔离 key 和短 TTL，不做跨租户复用，也不把大对象长期放进热层。
+
+把这些规则套回报表示例，就是：
 
 - 对公司统一分析规范这 3K tokens，adapter 识别为 `SYSTEM_PROMPT`。它用 `tenant_id + agent_id + model_id + token_hash + phase` 生成稳定 key，并把策略设为“高优先级保存、优先 HBM/DRAM、必要时 SSD 兜底”。原因是同一个企业报表 Agent 后续很多请求都会复用这段规范。
 - 对“分析华东区 Q2 销售异常”这句用户问题，adapter 识别为 `USER_QUERY`。它把 key 绑定到 `session_id`，设置短 TTL。原因是这段内容通常只对当前会话的后续几轮有用，不应该变成跨会话长期缓存。
-- 对 20K tokens 的 SQL 查询结果，adapter 识别为 `TOOL_OUTPUT`。如果这是常用报表 SQL，adapter 可以保存；如果只是一次性临时查询，adapter 会降低优先级或跳过保存。原因是大工具结果很容易挤占 HBM/DRAM。
+- 对 20K tokens 的 SQL 查询结果，adapter 识别为 `TOOL_OUTPUT`。它不会凭空知道这个 SQL 是否“常用”，而是看上游是否带了 `tool_name / workflow_id / cacheable` 之类的 hint，或者看配置规则和历史命中统计。信号足够时可以保存；信号不足时就降低优先级或跳过保存。原因是大工具结果很容易挤占 HBM/DRAM。
 - 对等待 SQL 时已经 prefill 的工具无关上下文，adapter 识别为 `PARTIAL_PREFILL`，在工具返回前临时 pin。原因是这部分如果被驱逐，工具返回后还要重复 prefill。
 - 对最终中文报告，adapter 识别为 `RESPONSE`，默认 skip-save。原因是最终回答很少作为后续请求的稳定前缀。
 
 **第三层：UMBP 按这些具体决策执行。**
 
-同一个例子落到 UMBP 时，可以对应成下面的执行链：
+到 UMBP 这一层时，业务语义已经被 adapter 翻译成 key、API 调用、tier policy 和轻量 metadata。UMBP 不再判断“报表规范是否重要”，只按这些输入执行：
 
 1. **系统提示词先用于路由。** 如果某个 worker 已经有“公司统一分析规范”的 KV，adapter 上报这段 `SYSTEM_PROMPT` 的 hash、节点和 tier。下一次同一 tenant 的报表请求进来时，adapter 调 `match_external_kv()`；UMBP master 返回可能命中的节点，router 优先把请求送过去，减少重复 prefill。
-2. **高价值内容再写入 UMBP。** 如果 adapter 判断系统提示词或常用 SQL 结果值得长期复用，就调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择 peer；peer 在 HBM/DRAM/SSD 中分配空间，真正保存 KV bytes。
+2. **高价值内容再写入 UMBP。** 对 `SYSTEM_PROMPT`，adapter 可以按默认规则认为它复用价值高；对 `TOOL_OUTPUT`，adapter 需要依据上游 hint、配置规则或历史命中统计判断是否值得保存。确认值得托管后，adapter 调用 `batch_put_from_ptr()`。UMBP master 通过 `RoutePut` 选择 peer；peer 在 HBM/DRAM/SSD 中分配空间，真正保存 KV bytes。
 3. **后续请求按 key 取回缺失 chunk。** 当新请求只缺少部分 KV chunk 时，adapter 调 `batch_get_into_ptr()`。UMBP master 用 `RouteGet` 查 `GlobalBlockIndex`，优先从 HBM/DRAM 返回；如果热层没有但 SSD 有副本，再从 SSD 回填。
 4. **缓存压力下按语义排序。** HBM/DRAM 空间紧张时，UMBP 不理解“报表规范”这个业务含义，但可以使用 adapter 给出的 `phase / priority / ttl` 排序：`SYSTEM_PROMPT` 尽量保留，低命中 `TOOL_OUTPUT` 下沉或驱逐，`RESPONSE` 因为 skip-save 不占 cache。
 
