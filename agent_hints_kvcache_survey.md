@@ -519,15 +519,26 @@ UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD
 ```text
 Agent Orchestrator / SGLang / vLLM
         │
-        │  messages / tool events / RAG context / session metadata
+        │  原始上下文：
+        │  - system message: 公司统一分析规范
+        │  - user message:   分析华东区 Q2 销售异常
+        │  - tool event:     SQL 查询结果
+        │  - metadata:       tenant_id / agent_id / session_id
         ▼
 UMBP Semantic KV Adapter
         │
-        │  token chunk key / semantic hint / save policy / routing policy
+        │  翻译结果：
+        │  - system message -> phase=SYSTEM_PROMPT，生成稳定 token chunk key
+        │  - SQL result     -> phase=TOOL_OUTPUT，按大小/命中率决定是否保存
+        │  - final answer   -> phase=RESPONSE，默认 skip-save
+        │  - 输出给 UMBP: key + metadata + put/report/skip 决策
         ▼
 MORI-UMBP
         │
-        │  opaque key + RouteGet/RoutePut + HBM/DRAM/SSD
+        │  执行动作：
+        │  - metadata-only: match_external_kv() 找已有 KV 的节点
+        │  - UMBP-owned:   RoutePut/RouteGet + batch_put/get 读写 KV bytes
+        │  - tier policy:  高价值 KV 优先 HBM/DRAM，必要时 SSD 兜底
 ```
 
 这个边界有两层含义：
