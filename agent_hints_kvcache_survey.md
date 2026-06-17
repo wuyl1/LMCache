@@ -514,12 +514,14 @@ RESPONSE           优先驱逐
 
 UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD，不同节点之间查找和搬运 KV，并通过 master 给读写请求做路由建议。[M1][M2][M3][M4][M5][M6] 但它不应该判断某段 token 是系统提示词、用户问题、工具结果，还是最终回答。语义判断、key 生成和策略选择放在 adapter；UMBP 继续按 opaque key、tier 和轻量 metadata 执行存取。
 
-本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。它们按 adapter 的处理流程展开：先识别语义，再生成生命周期 hint，随后生成可复用的 key，最后决定哪些 KV 值得进入缓存系统。
+本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。主线是 **semantic-driven cache policy optimization**：语义不是装饰字段，而是决定缓存价值、生命周期和准入策略的输入；同时，语义不能替代 key 正确性，真正的复用安全仍由 token chunk、模型、tokenizer、KV layout 和隔离字段保证。
 
-1. **Sutradhara 式语义 phase 标签**：先把上游上下文映射成 `SYSTEM_PROMPT / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN`。
-2. **Sutradhara 式 priority / event-based pin**：紧接 phase，把语义阶段转成 TTL、priority 和临时 pin 策略。
-3. **LMCache 式 chunk/prefix key 管理**：保证同一段 token KV 能稳定命中，不该复用的 KV 不会误命中。
-4. **Admission 与 skip-save 控制**：决定哪些 KV 只做短期本地使用、哪些可以上报 external index、哪些值得交给 UMBP 托管。
+这条语义优化链可以拆成四步：
+
+1. **语义价值识别**：先把上游上下文映射成 `SYSTEM_PROMPT / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN`，判断这段 KV 大致有什么缓存价值。
+2. **语义生命周期策略**：紧接 phase，把语义阶段转成 TTL、priority 和临时 pin 策略。
+3. **语义安全复用的 key 管理**：把 phase 与 token chunk、模型、tokenizer、KV layout、tenant/session 等一起编码进 canonical key，保证“值得缓存”不等于“可以误复用”。
+4. **语义准入与 skip-save 控制**：根据 phase、hint、大小和命中统计决定哪些 KV 只做短期本地使用、哪些可以上报 external index、哪些值得交给 UMBP 托管。
 
 ### 7.1 职责边界
 
@@ -555,9 +557,9 @@ MORI-UMBP
 
 UMBP master 和 peer 的关系可以理解为“路由建议”和“数据持有”的分工。master 通过 heartbeat 维护一个近似的 `GlobalBlockIndex`，为读写请求选择候选 peer；真正保存、读取和释放 KV block 的是 peer。[M2] 因此 adapter 上报给 master 的语义 metadata 应保持轻量，并尽量异步批量更新，不能让每个 token span 变化都变成同步 master 写入。
 
-### 7.2 功能一：Sutradhara 式语义 phase 标签
+### 7.2 功能一：语义 phase 与缓存价值识别
 
-第一个功能是识别 KV 的语义阶段。Adapter 不需要理解复杂业务，只需要把上游请求结构映射成少量稳定的 phase。phase 是后续 key、保存策略、TTL、priority 和 pin 的输入。
+第一个功能是把上层语义变成缓存策略可消费的价值信号。Adapter 不需要理解复杂业务，只需要把上游请求结构映射成少量稳定的 phase，用来区分“长期稳定前缀”“短期会话内容”“工具结果”“临时 prefill”和“默认不值得保存的 response”。phase 是后续 key、保存策略、TTL、priority 和 pin 的输入。
 
 ```text
 SYSTEM_PROMPT     # 长期稳定前缀，默认高复用价值
@@ -585,9 +587,9 @@ phase 的来源可以分两类：
 
 这些 span 后续会在 key 管理阶段映射到推理引擎的 KV block / page chunk 上。功能一只负责给 token 区间打语义标签，不负责证明 KV bytes 可以复用；复用正确性仍由功能三的 chunk/key 管理保证。
 
-### 7.3 功能二：priority 与 event-based pin
+### 7.3 功能二：语义生命周期策略
 
-第二个功能是把 phase 进一步转成生命周期和调度 hint。它和功能一强绑定：phase 回答“这段 KV 是什么”，priority / pin 回答“这段 KV 应该怎样被保存、保护和回收”。Adapter 可以生成：
+第二个功能是把语义价值进一步转成生命周期和调度 hint。它和功能一强绑定：phase 回答“这段 KV 是什么、价值大概在哪里”，priority / pin 回答“这段 KV 应该怎样被保存、保护和回收”。Adapter 可以生成：
 
 ```text
 ttl_ms      # 多久后可以回收
@@ -607,9 +609,9 @@ pin_until   # 临时保护到某个事件完成
 
 这些 hint 只是排序和保护信号。UMBP core 不需要知道“为什么这段内容重要”，只需要在路由、分层或回收策略中消费 adapter 给出的轻量 metadata。
 
-### 7.4 功能三：LMCache 式 key 管理
+### 7.4 功能三：语义安全复用的 key 管理
 
-第三个功能是保证复用正确性。phase 和 priority 只能说明“这段 KV 是否重要”，不能证明两次请求的 KV 可以复用。真正决定能否复用的，是 token chunk、模型、tokenizer 和 KV layout 是否一致。因此 adapter 要实现类似 LMCache 的 chunk/prefix key 管理。
+第三个功能是保证语义优化不会破坏复用正确性。phase 和 priority 只能说明“这段 KV 是否重要”，不能证明两次请求的 KV 可以复用。真正决定能否复用的，是 token chunk、模型、tokenizer 和 KV layout 是否一致。因此 adapter 要实现类似 LMCache 的 chunk/prefix key 管理。
 
 Adapter 可以按推理引擎 connector 的 KV block / page 粒度切分 token chunk，并为每个 chunk 生成标准化 cache key：
 
@@ -644,9 +646,9 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 - **语义边界和 chunk 边界不一定完全一致。** Adapter 应尽量在语义边界切 chunk；如果一个 chunk 同时包含 system prompt 末尾和 user query 开头，应使用更保守的 phase，例如 `UNKNOWN` 或较低 priority，避免把混合 chunk 当成长期 `SYSTEM_PROMPT` 保存。
 - **`RESPONSE` 不是默认要保存的 prefill 前缀。** 在线 decode 产生的最终回答默认 skip-save；只有当它在下一轮对话中作为 history 重新进入 prompt 时，adapter 才按新的 prompt span 重新切分和标注。
 
-### 7.5 功能四：admission 与 skip-save 控制
+### 7.5 功能四：语义准入与 skip-save 控制
 
-第四个功能不是再次定义复用边界，而是做缓存准入控制。功能三已经通过 canonical key 解决“能不能安全复用”；功能四回答另一个问题：即使一段 KV 可以被正确命名，它是否值得 report、put，或进入 UMBP-owned 路径。
+第四个功能是把语义价值落实到缓存准入控制。功能三已经通过 canonical key 解决“能不能安全复用”；功能四回答另一个问题：即使一段 KV 可以被正确命名，它是否值得 report、put，或进入 UMBP-owned 路径。
 
 Adapter 可以把每个 chunk 分成三类：
 
@@ -737,12 +739,12 @@ RESPONSE:       最终中文报告
 
 ### 7.8 小结：Adapter 的职责和收益
 
-Semantic KV Adapter 的核心职责不是替代 UMBP，而是把 Agent/推理框架里的上下文翻译成 UMBP 可以安全消费的 key、metadata 和 API 调用。围绕本节聚焦的四个功能，adapter 需要做这些事：
+Semantic KV Adapter 的核心职责不是替代 UMBP，而是把 Agent/推理框架里的上下文翻译成 UMBP 可以安全消费的 key、metadata 和 API 调用。围绕 semantic-driven cache policy optimization，adapter 需要做这些事：
 
-- **生成语义 phase hint**：优先读取上游已有字段，例如 message role、tool event、workflow metadata 和 `cacheable` 标记；缺失时按简单规则补默认值，例如 `role=system` 对应 `SYSTEM_PROMPT`。这里不是复杂业务理解，而是规则映射和默认值填充。
-- **提供 priority / pin 信号**：基于 phase 生成 priority 和 TTL；对 event-based pin，则优先消费上层 Agent / orchestrator 提供的事件边界，缺失时退化为 TTL-based 临时保护。
-- **生成正确 key**：按 token chunk、model、tokenizer、KV layout、tenant/session、reuse scope 和 phase 生成标准化 cache key，保证能复用的 KV 才会命中。
-- **执行 admission / skip-save 控制**：根据 phase、priority、TTL、大小和命中统计决定 skip、report 还是 put，避免低价值 KV 污染 external KV index 和热层缓存。
+- **识别语义价值**：优先读取上游已有字段，例如 message role、tool event、workflow metadata 和 `cacheable` 标记；缺失时按简单规则补默认值，例如 `role=system` 对应 `SYSTEM_PROMPT`。
+- **生成语义生命周期策略**：基于 phase 生成 priority 和 TTL；对 event-based pin，则优先消费上层 Agent / orchestrator 提供的事件边界，缺失时退化为 TTL-based 临时保护。
+- **保证语义安全复用**：按 token chunk、model、tokenizer、KV layout、tenant/session、reuse scope 和 phase 生成标准化 cache key，让语义价值指导策略，但不替代复用正确性判断。
+- **执行语义准入控制**：根据 phase、priority、TTL、大小和命中统计决定 skip、report 还是 put，避免低价值 KV 污染 external KV index 和热层缓存。
 
 预期收益也应分阶段看。metadata-only 阶段主要提升 routing 质量：请求更容易被送到已有 KV 的节点，减少重复 prefill，同时避免低价值 KV 污染 external KV index。UMBP-owned 阶段进一步带来跨节点 KV 复用和分层存储收益：高价值 KV 可以由 UMBP 托管，从 HBM/DRAM/SSD 中按最快可用 tier 取回。后续如果 UMBP 消费 adapter 提供的 `phase / priority / ttl`，还能减少 cache 污染，让系统提示词这类高复用 KV 比低命中工具结果更晚被回收。
 
