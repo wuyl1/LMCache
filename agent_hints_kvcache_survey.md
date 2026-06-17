@@ -575,6 +575,16 @@ phase 的来源可以分两类：
 
 这不是复杂业务理解，而是规则映射和默认值填充。phase 的作用也很明确：影响保存、上报、TTL、priority、pin，但不能替代 token chunk key。
 
+功能一的直接输出不是最终 cache key，而是一组 semantic spans，例如：
+
+```text
+(token_start=0,    token_end=3072,  phase=SYSTEM_PROMPT, source=role:system)
+(token_start=3072, token_end=3120,  phase=USER_QUERY,    source=role:user)
+(token_start=3120, token_end=23500, phase=TOOL_OUTPUT,   source=tool_event)
+```
+
+这些 span 后续会在 key 管理阶段映射到推理引擎的 KV block / page chunk 上。如果语义边界和 chunk 边界不一致，adapter 应使用更保守的 phase，例如 `UNKNOWN` 或较低 priority，避免把混合 chunk 当成长期稳定内容保存。
+
 ### 7.3 功能二：priority 与 event-based pin
 
 第二个功能是把 phase 进一步转成生命周期和调度 hint。它和功能一强绑定：phase 回答“这段 KV 是什么”，priority / pin 回答“这段 KV 应该怎么被保存、保护和回收”。Adapter 可以生成：
@@ -618,9 +628,9 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 具体实现可以按下面顺序做：
 
 ```text
-1. 从推理框架拿到 prompt tokens、model_id、tokenizer_id、kv_layout_version，以及上一节生成的 semantic spans。
+1. 从推理框架拿到 prompt tokens、model_id、tokenizer_id、kv_layout_version，以及功能一生成的 semantic spans。
 2. 按推理引擎 connector 的 KV block / page 粒度切分 token chunk，并记录 token chunk 到 KV page 或 byte range 的映射。chunk 大小应来自引擎配置，不应写死。
-3. 把 semantic span 映射到 chunk：
+3. 把 semantic span 落到 token chunk 上：
    - system message 覆盖的 chunk -> phase=SYSTEM_PROMPT
    - tool result 覆盖的 chunk     -> phase=TOOL_OUTPUT
    - assistant response 覆盖的 chunk -> phase=RESPONSE，默认 skip-save
