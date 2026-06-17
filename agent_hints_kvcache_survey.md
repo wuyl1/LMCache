@@ -598,25 +598,23 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 
 也就是说，没有显式 hint 时，先拿到“不会错复用”和“尽量路由到已有 KV 节点”的收益；等 adapter 能稳定识别 system prompt、tool output、partial prefill 后，再做语义分层、语义驱逐和 partial prefill pin。
 
-### 7.4 接入 UMBP 的方式
+### 7.4 Adapter 如何接入 UMBP
 
-基本原理是先区分两件事：**知道 KV 在哪里** 和 **真正保存 KV bytes**。
+Adapter 拿到 `SemanticKvHint` 后，并不是一定要把所有 KV bytes 都交给 UMBP。它可以根据 `phase / reuse_scope / ttl / priority` 选择不同接入深度。核心区别是：**只让 UMBP 知道 KV 在哪里**，还是 **让 UMBP 真正保存 KV bytes**。
 
-第一种情况，KV bytes 仍然放在 SGLang/vLLM 自己的 cache 里。UMBP 只保存一份 metadata，记录“某个 hash 的 KV 可能在哪个节点、哪个 tier 上”。这时 UMBP 的作用更像路由索引：下次类似请求进来时，可以把请求送到已有 KV 的节点，减少重复 prefill。
+**方式一：metadata-only 接入，用 UMBP 做路由索引。**
 
-第二种情况，KV bytes 直接交给 UMBP 管。UMBP 不只保存 metadata，还负责选择 peer、写入 HBM/DRAM/SSD、读取时从最快 tier 取回。这条路径收益更完整，但也需要 adapter 正确处理 page layout、dtype、model id、tokenizer id 和 KV layout version。
+KV bytes 仍然放在 SGLang/vLLM 自己的 cache 里。Adapter 只把 hash、tier、所在节点和少量语义 metadata 上报给 UMBP master，走 `report_external_kv_blocks()` / `match_external_kv()`。[M2][M5] 这时 UMBP 不搬运 KV bytes，只回答一个问题：哪些节点可能已经有这段 KV？router 可以据此把类似请求送到已有 KV 的节点，减少重复 prefill。
 
-因此接入可以分两步，先轻后重。
+这条路径适合作为第一阶段：风险小，不改 UMBP 数据面，也不要求推理引擎马上把 KV layout 交给 UMBP 管。
 
-**第一步：只上报 external KV metadata。**
+**方式二：UMBP-owned 接入，让 UMBP 托管高价值 KV。**
 
-KV bytes 仍在 SGLang/vLLM 自己的 cache 中，adapter 只把 hash、tier 和少量 metadata 报给 UMBP master，走 `report_external_kv_blocks()` / `match_external_kv()`。这样可以先做 KV-aware routing，风险小，也不改 UMBP 数据面。[M2][M5]
+当 adapter 判断某段 KV 值得长期复用，例如 `SYSTEM_PROMPT` 或高命中 `TOOL_OUTPUT`，它可以通过 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()` 让 UMBP 直接保存和读取 KV bytes。[M2][M4] 这时 UMBP 会通过 `RoutePut` 选择 peer，peer 负责把 KV bytes 放到 HBM/DRAM/SSD；读取时再通过 `RouteGet` 从最快 tier 取回。
 
-**第二步：把高价值 KV 交给 UMBP 管。**
+这条路径收益更完整，但要求 adapter 正确处理 page layout、dtype、model id、tokenizer id 和 KV layout version，否则不同模型或不同 KV layout 的 bytes 可能被错误复用。
 
-对系统提示词、高命中工具结果这类复用价值高的 KV，adapter 再通过 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()` 让 UMBP 直接保存和读取 KV bytes。[M2][M4]
-
-具体哪些 KV 值得保存、保存多久、放在哪个 tier，由 adapter 根据 hint 和配置决定。落地顺序建议是：先做语义 key 和 external KV routing；确认有收益后，再把高价值 KV 接入 UMBP-owned KV；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
+因此，推荐落地顺序是：adapter 先做语义 key 和 metadata-only routing；确认路由收益后，再把少量高价值 KV 接入 UMBP-owned 路径；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
 
 ### 7.5 一个具体例子
 
