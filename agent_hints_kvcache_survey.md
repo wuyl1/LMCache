@@ -606,13 +606,27 @@ Adapter 拿到 `SemanticKvHint` 后，并不是一定要把所有 KV bytes 都�
 
 KV bytes 仍然放在 SGLang/vLLM 自己的 cache 里。Adapter 只把 hash、tier、所在节点和少量语义 metadata 上报给 UMBP master，走 `report_external_kv_blocks()` / `match_external_kv()`。[M2][M5] 这时 UMBP 不搬运 KV bytes，只回答一个问题：哪些节点可能已经有这段 KV？router 可以据此把类似请求送到已有 KV 的节点，减少重复 prefill。
 
-这条路径适合作为第一阶段：风险小，不改 UMBP 数据面，也不要求推理引擎马上把 KV layout 交给 UMBP 管。
+这条路径适合作为第一阶段：风险小，不改 UMBP 数据面，也不要求推理引擎马上把 KV layout 交给 UMBP 管。它的收益主要是路由层面的：
+
+- Adapter 可以优先上报 `SYSTEM_PROMPT`、高命中 `TOOL_OUTPUT` 这类值得复用的 KV metadata，让后续请求更容易被路由到已有 KV 的节点。
+- Adapter 可以不报告 `RESPONSE` 或低价值大对象，避免低复用内容污染 external KV index。
+- `tenant_id / session_id / reuse_scope` 可以进入 key 或 metadata，减少跨租户、跨会话的错误匹配。
+- `ttl_ms` 到期后，adapter 可以撤销或停止上报 metadata，让过期 KV 不再影响路由。
+
+它不能带来完整的 UMBP tier placement 或驱逐收益，因为 KV bytes 仍由 SGLang/vLLM 自己管理；UMBP 只参与“找对节点”，不参与“保存和回收 bytes”。
 
 **方式二：UMBP-owned 接入，让 UMBP 托管高价值 KV。**
 
 当 adapter 判断某段 KV 值得长期复用，例如 `SYSTEM_PROMPT` 或高命中 `TOOL_OUTPUT`，它可以通过 `UMBPClient.batch_put_from_ptr()` / `batch_get_into_ptr()` 让 UMBP 直接保存和读取 KV bytes。[M2][M4] 这时 UMBP 会通过 `RoutePut` 选择 peer，peer 负责把 KV bytes 放到 HBM/DRAM/SSD；读取时再通过 `RouteGet` 从最快 tier 取回。
 
-这条路径收益更完整，但要求 adapter 正确处理 page layout、dtype、model id、tokenizer id 和 KV layout version，否则不同模型或不同 KV layout 的 bytes 可能被错误复用。
+这条路径收益更完整：
+
+- 高价值 KV 不再只依赖某个 vLLM/SGLang worker 的本地 cache，而是可以由 UMBP 统一托管。
+- UMBP 可以按 tier policy 把 `SYSTEM_PROMPT` 这类高复用 KV 优先放在 HBM/DRAM，必要时用 SSD 做兜底副本。
+- 后续请求即使命中在不同节点，也可以通过 `RouteGet` 和 `batch_get_into_ptr()` 把缺失 KV chunk 取回，减少重复 prefill。
+- 当 HBM/DRAM 有压力时，adapter 提供的 `phase / priority / ttl` 可以参与驱逐排序，让 `SYSTEM_PROMPT` 比低命中 `TOOL_OUTPUT` 更晚被回收。
+
+代价是 adapter 必须正确处理 page layout、dtype、model id、tokenizer id 和 KV layout version，否则不同模型或不同 KV layout 的 bytes 可能被错误复用。因此这条路径更适合作为第二阶段，在 metadata-only routing 验证收益后再接入。
 
 因此，推荐落地顺序是：adapter 先做语义 key 和 metadata-only routing；确认路由收益后，再把少量高价值 KV 接入 UMBP-owned 路径；最后再考虑语义驱逐和 partial prefill pin。这样每一步都能独立验证，不需要一次性改 UMBP core。
 
