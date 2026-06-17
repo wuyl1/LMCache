@@ -578,6 +578,12 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
                  reuse_scope, phase)
 ```
 
+这个 key 是 adapter 和 UMBP 之间的 KV 身份标识，用法有三种：
+
+- **external KV report/match**：adapter 用 key 上报“这个 KV chunk 在哪个 worker、哪个 tier”；下一次请求生成同一个 key 后，用 `match_external_kv()` 找已有 KV 的节点。
+- **UMBP-owned put/get**：adapter 用 key 调 `batch_put_from_ptr()` 保存 KV bytes；后续请求生成同一个 key 后，用 `batch_get_into_ptr()` 取回 KV bytes。
+- **隔离和防错复用**：key 中包含 model、tokenizer、KV layout、tenant/session 和 phase，确保不同模型、不同租户或不同复用范围的 KV 不会误命中。
+
 具体实现可以按下面顺序做：
 
 ```text
