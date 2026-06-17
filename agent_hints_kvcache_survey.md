@@ -517,9 +517,9 @@ UMBP 更像一个高性能 KV 仓库。它擅长把 KV block 放到 HBM/DRAM/SSD
 本节只聚焦 adapter 的四个功能，避免把方案写成大而全的缓存系统。这四个功能分别来自 LMCache 和 Sutradhara 的核心启发：
 
 1. **Sutradhara 式语义 phase 标签**：先把上游上下文映射成 `SYSTEM_PROMPT / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN`。
-2. **LMCache 式 chunk/prefix key 管理**：再保证同一段 token KV 能稳定命中，不该复用的 KV 不会误命中。
-3. **LMCache 式隔离与 skip-save**：用 tenant/session/reuse scope 控制复用边界，对低价值内容跳过保存。
-4. **Sutradhara 式 priority / event-based pin**：把高价值 KV 标成高优先级，把临时关键 KV pin 到工具调用返回等事件完成。
+2. **Sutradhara 式 priority / event-based pin**：紧接 phase，把语义阶段转成 TTL、priority 和临时 pin 策略。
+3. **LMCache 式 chunk/prefix key 管理**：保证同一段 token KV 能稳定命中，不该复用的 KV 不会误命中。
+4. **LMCache 式隔离与 skip-save**：用 tenant/session/reuse scope 控制复用边界，对低价值内容跳过保存。
 
 ### 7.1 职责边界
 
@@ -575,9 +575,31 @@ phase 的来源可以分两类：
 
 这不是复杂业务理解，而是规则映射和默认值填充。phase 的作用也很明确：影响保存、上报、TTL、priority、pin，但不能替代 token chunk key。
 
-### 7.3 功能二：LMCache 式 key 管理
+### 7.3 功能二：priority 与 event-based pin
 
-第二个功能是复用正确性。语义标签只能说明“这段 KV 是否重要”，不能证明两次请求的 KV 可以复用。真正决定能否复用的，是 token chunk、模型、tokenizer 和 KV layout 是否一致。因此 adapter 要实现类似 LMCache 的 chunk/prefix key 管理。
+第二个功能是把 phase 进一步转成生命周期和调度 hint。它和功能一强绑定：phase 回答“这段 KV 是什么”，priority / pin 回答“这段 KV 应该怎么被保存、保护和回收”。Adapter 可以生成：
+
+```text
+ttl_ms      # 多久后可以回收
+priority    # 分层或驱逐排序时的优先级提示
+pin_until   # 临时保护到某个事件完成
+```
+
+这些字段可以由编排器显式提供，也可以由 adapter 根据 phase 和配置给默认值。例如：
+
+- `SYSTEM_PROMPT` 默认高 priority、较长 TTL。
+- `USER_QUERY` 默认短 TTL。
+- `TOOL_OUTPUT` 根据大小、工具类型和命中统计决定 priority。
+- `PARTIAL_PREFILL` 可以 pin 到“工具调用返回”或“extend prefill 完成”。
+- `RESPONSE` 默认 skip-save，因此通常不进入 pin/eviction 路径。
+
+这里要区分两类依赖：`priority` 可以部分由 adapter 根据 phase 默认推导；`event-based pin` 更依赖上层 Agent / orchestrator 提供事件边界。没有显式事件 hint 时，adapter 不应该假设自己能判断业务生命周期，而应退化为 TTL-based 临时保护。
+
+这些 hint 只是排序和保护信号。UMBP core 不需要知道“为什么这段内容重要”，只需要在路由、分层或回收策略中消费 adapter 给出的轻量 metadata。
+
+### 7.4 功能三：LMCache 式 key 管理
+
+第三个功能是复用正确性。语义标签和 priority 只能说明“这段 KV 是否重要”，不能证明两次请求的 KV 可以复用。真正决定能否复用的，是 token chunk、模型、tokenizer 和 KV layout 是否一致。因此 adapter 要实现类似 LMCache 的 chunk/prefix key 管理。
 
 Adapter 可以按推理引擎 connector 的 KV block / page 粒度切分 token chunk，并为每个 chunk 生成标准化 cache key：
 
@@ -612,9 +634,9 @@ cache_key = hash(model_id, tokenizer_id, kv_layout_version,
 - **语义边界和 chunk 边界不一定完全一致。** Adapter 应尽量在语义边界切 chunk；如果一个 chunk 同时包含 system prompt 末尾和 user query 开头，应使用更保守的 phase，例如 `UNKNOWN` 或较低 priority，避免把混合 chunk 当成长期 `SYSTEM_PROMPT` 保存。
 - **`RESPONSE` 不是默认要保存的 prefill 前缀。** 在线 decode 产生的最终回答默认 skip-save；只有当它在下一轮对话中作为 history 重新进入 prompt 时，adapter 才按新的 prompt span 重新切分和标注。
 
-### 7.4 功能三：隔离与 skip-save
+### 7.5 功能四：隔离与 skip-save
 
-第三个功能是控制“哪些 KV 可以复用”和“哪些 KV 根本不该保存”。这部分借鉴 LMCache 的 `cache_salt`、tag isolation 和 `skip_save` 思路，但落在 UMBP adapter 的 key 和策略上。
+第四个功能是控制“哪些 KV 可以复用”和“哪些 KV 根本不该保存”。这部分借鉴 LMCache 的 `cache_salt`、tag isolation 和 `skip_save` 思路，但落在 UMBP adapter 的 key 和策略上。
 
 Adapter 可以使用这些字段控制复用边界：
 
@@ -631,26 +653,6 @@ Adapter 可以使用这些字段控制复用边界：
 - 大型低命中 `TOOL_OUTPUT` 默认降低优先级或跳过保存，避免污染 HBM/DRAM。
 
 如果上游没有显式 hint，也没有配置规则或命中统计，adapter 就走保守默认：只做隔离 key 和短 TTL，不做跨租户复用，也不把大对象长期放进热层。这样至少能拿到“不会错复用”和“尽量路由到已有 KV 节点”的收益。
-
-### 7.5 功能四：priority 与 event-based pin
-
-第四个功能是把 Sutradhara 的 priority 和 event-based pin 思路变成轻量 hint。Adapter 可以生成：
-
-```text
-ttl_ms      # 多久后可以回收
-priority    # 分层或驱逐排序时的优先级提示
-pin_until   # 临时保护到某个事件完成
-```
-
-这些字段可以由编排器显式提供，也可以由 adapter 根据 phase 和配置给默认值。例如：
-
-- `SYSTEM_PROMPT` 默认高 priority、较长 TTL。
-- `USER_QUERY` 默认短 TTL。
-- `TOOL_OUTPUT` 根据大小、工具类型和命中统计决定 priority。
-- `PARTIAL_PREFILL` 可以 pin 到“工具调用返回”或“extend prefill 完成”。
-- `RESPONSE` 默认 skip-save，因此通常不进入 pin/eviction 路径。
-
-这些 hint 只是排序和保护信号。UMBP core 不需要知道“为什么这段内容重要”，只需要在路由、分层或回收策略中消费 adapter 给出的轻量 metadata。
 
 ### 7.6 Adapter 如何接入 UMBP
 
@@ -726,9 +728,9 @@ RESPONSE:       最终中文报告
 Semantic KV Adapter 的核心职责不是替代 UMBP，而是把 Agent/推理框架里的上下文翻译成 UMBP 可以安全消费的 key、metadata 和 API 调用。围绕本节聚焦的四个功能，adapter 需要做这些事：
 
 - **生成语义 phase hint**：优先读取上游已有字段，例如 message role、tool event、workflow metadata 和 `cacheable` 标记；缺失时按简单规则补默认值，例如 `role=system` 对应 `SYSTEM_PROMPT`。这里不是复杂业务理解，而是规则映射和默认值填充。
+- **提供 priority / pin 信号**：基于 phase 生成 priority 和 TTL；对 event-based pin，则优先消费上层 Agent / orchestrator 提供的事件边界，缺失时退化为 TTL-based 临时保护。
 - **生成正确 key**：按 token chunk、model、tokenizer、KV layout、tenant/session 和 phase 生成标准化 cache key，保证能复用的 KV 才会命中。
 - **控制复用边界和 skip-save**：用 `tenant_id / session_id / reuse_scope` 控制匹配范围；对 `RESPONSE` 和低价值大对象默认不 report、不 put。
-- **提供 priority / pin 信号**：把 priority、TTL、pin-until-event 等轻量信息传给 UMBP 的路由、分层和回收路径，但不要求 UMBP core 理解业务语义。
 
 预期收益也应分阶段看。metadata-only 阶段主要提升 routing 质量：请求更容易被送到已有 KV 的节点，减少重复 prefill，同时避免低价值 KV 污染 external KV index。UMBP-owned 阶段进一步带来跨节点 KV 复用和分层存储收益：高价值 KV 可以由 UMBP 托管，从 HBM/DRAM/SSD 中按最快可用 tier 取回。后续如果 UMBP 消费 adapter 提供的 `phase / priority / ttl`，还能减少 cache 污染，让系统提示词这类高复用 KV 比低命中工具结果更晚被回收。
 
