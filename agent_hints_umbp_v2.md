@@ -12,7 +12,7 @@ v2 的目标是：
 
 1. **贴合现有软件架构**：系统已有 scheduler，缓存策略应由 scheduler 统一决策，而不是新增 adapter 分裂控制面。
 2. **分层接收 hints**：先支持稳定、容易生产的 base hints，再扩展到包含语义和 key 管理的 advanced hints。
-3. **协同扩展 UMBP 控制面**：UMBP 继续承担执行层职责，但可以新增 `pin / demote / evict / update TTL` 等 key/block-level policy controls。
+3. **协同扩展 UMBP 控制面**：UMBP 继续承担执行层职责，但可以新增 `pin / demote / evict / update phase TTL` 等 key/block-level policy controls。
 4. **围绕 semantic-driven cache policy optimization**：语义用于决定缓存价值、生命周期、准入和 eviction/pin 策略；复用安全仍由 token chunk、model、tokenizer、KV layout 和隔离字段保证。
 
 ---
@@ -25,7 +25,7 @@ v2 的核心链路是：
 +------------------------------------------------------------+
 | Agent / Harness / Agent Orchestrator                       |
 |                                                            |
-| base hints: session_id / ttl / priority                    |
+| base hints: session_id / session_timeout / priority        |
 | advanced:   semantic spans / reuse_scope / key fields      |
 +-----------------------------+------------------------------+
                               |
@@ -41,27 +41,27 @@ v2 的核心链路是：
 | Scheduler                                                  |
 |                                                            |
 | decide route / prefetch / report / put / revoke / tiering  |
-| decide TTL / priority / pin / eviction                     |
+| decide phase TTL / priority / pin / eviction               |
 +-----------------------------+------------------------------+
                               |
               +---------------+---------------+
               |                               |
               v                               v
-+----------------------------+       +----------------------------------+
-| Inference Workers          |       | UMBP                             |
-| SGLang / vLLM / others     |       |                                  |
-|                            |       | Existing data/index APIs:        |
-| - prefill / decode         |       | - match/report/revoke external KV|
-| - local KV cache           |       | - RoutePut / RouteGet            |
-| - expose KV layout / ptr   |       | - batch_put/get ptr APIs         |
-| - consume fetched KV       |       | - peer-owned tier storage        |
-|                            |       |                                  |
-|                            |       | Proposed agent-hint controls:    |
-|                            |       | - pin / unpin by key or block    |
-|                            |       | - demote / promote across tiers  |
-|                            |       | - evict / expire / update TTL    |
-|                            |       | - priority and admission policy  |
-+-------------+--------------+       +----------------+-----------------+
++----------------------------+       +------------------------------------+
+| Inference Workers          |       | UMBP                               |
+| SGLang / vLLM / others     |       |                                    |
+|                            |       | Existing data/index APIs:          |
+| - prefill / decode         |       | - match/report/revoke external KV  |
+| - local KV cache           |       | - RoutePut / RouteGet              |
+| - expose KV layout / ptr   |       | - batch_put/get ptr APIs           |
+| - consume fetched KV       |       | - peer-owned tier storage          |
+|                            |       |                                    |
+|                            |       | Proposed agent-hint controls:      |
+|                            |       | - pin / unpin by key or block      |
+|                            |       | - demote / promote across tiers    |
+|                            |       | - evict / expire / update phase_ttl|
+|                            |       | - priority and admission policy    |
++-------------+--------------+       +-----------------+------------------+
               |                                       ^
               | metadata report: external KV hash,    |
               | tier, node id, block metadata         |
@@ -80,7 +80,7 @@ v2 的核心链路是：
               +-------------------------------------->|
                                                       |
 Scheduler -> UMBP policy API:
-  pin / demote / evict / update TTL / update priority
+  pin / demote / evict / update phase TTL / update priority
 
 UMBP -> Scheduler feedback:
   policy result / matched candidates / tier state / pressure signal
@@ -89,7 +89,7 @@ UMBP -> Scheduler feedback:
 这个架构中，scheduler 是策略中枢，worker 和 UMBP 是并行执行子系统：
 
 - 它像 Dynamo Router 一样消费请求级 hints，做 routing、queueing、KV locality 和 session affinity。
-- 它也消费 advanced semantic hints，做更细粒度的 KV admission、TTL、priority、pin 和 eviction/tier 策略。
+- 它也消费 advanced semantic hints，做更细粒度的 KV admission、phase TTL、priority、pin 和 eviction/tier 策略。
 - Request Frontend 对应 Dynamo 中的 `dynamo.frontend` 职责：接收 OpenAI/Anthropic-compatible 请求，解析 hints 和 session metadata，并把请求交给 scheduler/router。
 - 推理 worker 负责 prefill/decode、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
 - UMBP 的 master 更像 routing advisor，维护 external KV index 和 owned-key routing state；真正的 KV slot、page location、tier storage 和 eviction 由 peer 持有和执行。
@@ -121,7 +121,6 @@ base:
   tenant_id               # 租户隔离
   priority                # 请求或缓存保留优先级
   strict_priority         # 可选，强优先级层级
-  ttl_ms                  # 请求相关 KV 的默认生命周期
   expected_output_tokens  # 类似 Dynamo osl，用于输出 KV block 负载估计
   expected_next_call_ms   # 类似 iat，用于估计下一轮请求间隔
   total_expected_calls    # 类似 total_requests，用于估计会话或 agent run 剩余生命周期
@@ -133,9 +132,10 @@ base:
 
 - `session_id` 让 scheduler 做 sticky session routing，减少同一会话 KV 在 worker 间漂移。
 - `priority` 影响 scheduler queue ordering、UMBP eviction/tier 策略。
-- `ttl_ms` 告诉 scheduler 某类 KV 多久后可以降级、撤销 metadata 或回收。
 - `expected_output_tokens` 帮助 scheduler 估算 decode 阶段的 KV 增长和 worker 未来负载。
 - `session_action` / `session_timeout_ms` 支持 session open/close、subagent 生命周期和自动清理。
+
+Base 层的生命周期语义应贴近 Dynamo 的 `session_control.timeout`：`session_timeout_ms` 表示 session 多久不活跃后可以关闭，用于 sticky routing、session KV isolation 和清理。它不是某个 semantic span 或 KV block 的缓存 TTL。
 
 Base hints 的价值在于低门槛：即使没有 token span 级语义，scheduler 也能先获得 routing locality、session isolation、priority queueing 和生命周期控制收益。
 
@@ -173,9 +173,11 @@ advanced:
 Advanced hints 在 base hints 之上提供缓存价值判断和安全复用所需的信息：
 
 - **语义价值识别**：识别 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`RESPONSE` 等不同 KV 的复用价值。
-- **语义生命周期策略**：把 phase 转成 TTL、priority、pin 或 demote/evict 策略。
+- **语义生命周期策略**：把 phase 转成 phase TTL、priority、pin 或 demote/evict 策略。
 - **语义安全复用**：把 phase、reuse scope、tenant/session 与 LMCache-style token chunk key 结合，避免“语义相似”导致错复用。
 - **语义准入控制**：决定 chunk 是 `skip`、`report` 还是 `put`。
+
+也就是说，`semantic_spans` 只描述 token 区间和 phase；`phase_ttl_ms`、`pin_until_event`、`admission` 这些缓存策略由 scheduler 根据 phase、默认策略、命中率和资源压力衍生出来。上层可以显式建议这些 policy，但 scheduler 应保留最终裁剪和覆盖权。
 
 Advanced hints 不要求一次性全部具备。没有显式 semantic spans 时，scheduler 可以根据 message role、tool event 和默认规则生成保守 phase；没有完整 key_identity 时，只允许 metadata-only routing，不进入 UMBP-owned KV bytes 托管。
 
@@ -238,29 +240,32 @@ estimated_output_blocks = ceil(expected_output_tokens / block_size)
 - 在 routing 时同时考虑 prefill KV overlap 和 decode 未来负载。
 - 在 UMBP tier 策略中预留或限制热层空间。
 
-### 4.4 TTL 与 Lifecycle
+### 4.4 Lifecycle 与 Phase TTL
 
-Base `ttl_ms` 和 advanced `phase_ttl_ms` 都是生命周期 hint。
+Base `session_timeout_ms` 和 advanced `phase_ttl_ms` 是两层不同的生命周期 hint：
 
-Scheduler 可以把 TTL 转成不同所有权模式下的动作：
+- `session_timeout_ms` 对应 Dynamo `session_control.timeout`，表示 session 多久不活跃后可以关闭。
+- `phase_ttl_ms` 是 semantic span 级缓存 TTL，由 `semantic_spans.phase` 衍生，用来决定某段 KV 多久还值得保留。
 
-- metadata-only 模式下，TTL 到期后 revoke external KV metadata。
-- UMBP-owned 模式下，TTL 到期后降低 priority、迁移到冷 tier，或通过 proposed policy controls 显式释放。
-- event-based pin 缺失时，用 TTL 作为兜底，避免 KV 被无限保护。
+Scheduler 可以把 phase TTL 转成不同所有权模式下的动作：
+
+- metadata-only 模式下，phase TTL 到期后 revoke external KV metadata。
+- UMBP-owned 模式下，phase TTL 到期后降低 priority、迁移到冷 tier，或通过 proposed policy controls 显式释放。
+- event-based pin 缺失时，用 phase TTL 作为兜底，避免 KV 被无限保护。
 
 示例：
 
 ```text
 SYSTEM_PROMPT:
-  ttl_ms = long
+  phase_ttl_ms = long
   priority = high
 
 USER_QUERY:
-  ttl_ms = short
+  phase_ttl_ms = short
   reuse_scope = SESSION
 
 PARTIAL_PREFILL:
-  ttl_ms = very_short
+  phase_ttl_ms = very_short
   pin_until_event = tool_returned
 
 RESPONSE:
@@ -285,11 +290,11 @@ put:
 推荐默认策略：
 
 - `SYSTEM_PROMPT`：默认 report；高命中或全局共享前缀可 put。
-- `USER_QUERY`：session-scoped、短 TTL，通常 report，不长期 put。
+- `USER_QUERY`：session-scoped、短 phase TTL，通常 report，不长期 put。
 - `TOOL_OUTPUT`：根据大小、cacheable hint 和命中统计决定；大且低命中时 skip 或 report。
-- `PARTIAL_PREFILL`：短 TTL，可保护到工具返回。
+- `PARTIAL_PREFILL`：短 phase TTL，可保护到工具返回。
 - `RESPONSE`：默认 skip，不 report、不 put。
-- `UNKNOWN`：保守处理，skip 或短 TTL report。
+- `UNKNOWN`：保守处理，skip 或短 phase TTL report。
 
 ### 4.6 Canonical Key 生成与安全复用
 
@@ -342,10 +347,10 @@ Scheduler decision
         └── owned-by-UMBP bytes path:
               ├── put    -> UMBP batch_put_from_ptr()
               ├── get    -> UMBP batch_get_into_ptr()
-              ├── policy -> priority / depth / TTL / tier hints
+              ├── policy -> priority / depth / phase TTL / tier hints
               │
               └── proposed policy controls:
-                    ├── pin    -> protect key/block until event or TTL
+                    ├── pin    -> protect key/block until event or phase TTL
                     ├── demote -> move key/block from hot tier to colder tier
                     └── evict  -> release low-value key/block explicitly
 ```
@@ -357,12 +362,12 @@ Scheduler decision
 - UMBP-owned bytes path 使用 `batch_put_from_ptr()` / `batch_get_into_ptr()` 托管和取回 KV bytes；peer 持有真实 slot、page location、tier storage 和 eviction 状态。
 - UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
 
-在这个基础上，`pin`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口。它们不是当前源码已经稳定暴露的基础数据面接口，而是把 scheduler 从“只给 priority/TTL 建议”推进到“可以显式保护、降级和释放特定 KV”的闭环控制。
+在这个基础上，`pin`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口。它们不是当前源码已经稳定暴露的基础数据面接口，而是把 scheduler 从“只给 priority / phase TTL 建议”推进到“可以显式保护、降级和释放特定 KV”的闭环控制。
 
 这类新增接口建议保持 key/block-level，而不是 semantic-level：
 
 ```text
-pin(key_or_block, until_event | ttl)
+pin(key_or_block, until_event | phase_ttl)
   protect hot or event-critical KV from eviction
 
 demote(key_or_block, target_tier)
@@ -372,7 +377,7 @@ evict(key_or_block, reason)
   release KV that scheduler has classified as low-value or expired
 ```
 
-Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `PARTIAL_PREFILL` 可以保护到 tool result 返回，`SYSTEM_PROMPT` 可以长期保留在热层，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、TTL 和 priority，不需要理解这些 phase 的业务语义。
+Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `PARTIAL_PREFILL` 可以保护到 tool result 返回，`SYSTEM_PROMPT` 可以长期保留在热层，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、phase TTL 和 priority，不需要理解这些 phase 的业务语义。
 
 ---
 
@@ -398,7 +403,6 @@ Agent、Harness 或 Agent Orchestrator 可以产生 base hints；Request Fronten
     "session_id": "report-task-001",
     "tenant_id": "tenant-a",
     "priority": 5,
-    "ttl_ms": 300000,
     "expected_output_tokens": 1024,
     "session_action": "open",
     "session_timeout_ms": 600000
@@ -444,7 +448,7 @@ Agent、Harness 或 Agent Orchestrator 可以产生 base hints；Request Fronten
 
 ### 6.2 Scheduler 决策
 
-Scheduler 把 hints 转成 admission、routing、tier 和 lifecycle 策略：
+Scheduler 把 base hints 和 semantic spans 转成 admission、routing、tier 和 lifecycle 策略：
 
 ```text
 SYSTEM_PROMPT:
@@ -452,12 +456,12 @@ SYSTEM_PROMPT:
   - admission = report
   - 如果命中率高，升级为 put
   - priority = high
-  - ttl = long
+  - phase_ttl_ms = long
 
 USER_QUERY:
   - reuse_scope = SESSION
   - admission = report
-  - ttl = short
+  - phase_ttl_ms = short
 
 TOOL_OUTPUT:
   - 如果 cacheable=false 或过大且低命中，admission = skip
@@ -465,7 +469,7 @@ TOOL_OUTPUT:
 
 PARTIAL_PREFILL:
   - pin_until_event = tool_returned
-  - ttl = very short
+  - phase_ttl_ms = very short
 
 RESPONSE:
   - admission = skip
@@ -485,7 +489,7 @@ Scheduler 再把策略落到 UMBP 的 metadata path、bytes path 和 proposed po
 3. batch_put_from_ptr(system_prompt_key, kv_ptr)
    -> 对高命中系统提示词，交给 UMBP 托管。
 
-4. pin / demote / evict / update TTL
+4. pin / demote / evict / update phase TTL
    -> 对高价值 KV 做事件级保护，对短期 user query / tool output 到期降级或释放。
 ```
 
@@ -502,7 +506,7 @@ Scheduler 再把策略落到 UMBP 的 metadata path、bytes path 和 proposed po
 - `session_id`
 - `tenant_id`
 - `priority`
-- `ttl_ms`
+- `session_timeout_ms`
 - `expected_output_tokens`
 - `session_action`
 
@@ -511,7 +515,7 @@ Scheduler 做：
 - sticky session routing
 - UMBP `match_external_kv()`
 - UMBP `report_external_kv_blocks()`
-- TTL 到期 revoke metadata
+- session timeout 到期 revoke metadata
 - priority queueing
 
 收益：
@@ -534,7 +538,7 @@ Scheduler 做：
 - `SYSTEM_PROMPT` 优先 report/put
 - `RESPONSE` 默认 skip
 - `TOOL_OUTPUT` 根据 cacheable、大小、命中统计做 admission
-- `PARTIAL_PREFILL` 短 TTL；event pin 作为 scheduler 侧保护策略
+- `PARTIAL_PREFILL` 短 phase TTL；event pin 作为 scheduler 侧保护策略
 
 收益：
 
@@ -548,14 +552,14 @@ Scheduler 做：
 - 完整 canonical key
 - KV layout metadata
 - `batch_put_from_ptr()` / `batch_get_into_ptr()`
-- tier placement / eviction priority / TTL policy hints
+- tier placement / eviction priority / phase TTL policy hints
 - proposed `pin` / `demote` / `evict` policy controls
 
 Scheduler 做：
 
 - 只把高价值 KV 交给 UMBP 托管。
-- 根据 priority / TTL / phase 影响 HBM/DRAM/SSD 分层和 eviction 顺序。
-- 在事件结束或 TTL 到期后调用 policy controls，允许 UMBP 降级、回收或撤销 metadata。
+- 根据 priority / phase TTL / phase 影响 HBM/DRAM/SSD 分层和 eviction 顺序。
+- 在事件结束或 phase TTL 到期后调用 policy controls，允许 UMBP 降级、回收或撤销 metadata。
 
 收益：
 
@@ -570,7 +574,7 @@ Scheduler 做：
 2. **Base first, advanced later.** 先落地稳定请求级 hints，再引入 token span 级语义。
 3. **Hints are soft.** Scheduler 可以接受、裁剪、忽略或降级 hints，避免上层无限 pin 或污染缓存。
 4. **Semantic value is not reuse correctness.** 语义决定缓存价值和生命周期；canonical key 决定能否安全复用。
-5. **Extend UMBP at key/block level.** 新增 policy controls 应围绕 opaque key、block id、TTL、priority 和 tier，不把 Agent 语义下沉到 UMBP core。
+5. **Extend UMBP at key/block level.** 新增 policy controls 应围绕 opaque key、block id、phase TTL、priority 和 tier，不把 Agent 语义下沉到 UMBP core。
 
 ---
 
@@ -578,7 +582,7 @@ Scheduler 做：
 
 UMBP Agent Hints v2 的核心变化是：**从 adapter-centric 改为 scheduler-centric**。
 
-Base hints 借鉴 Dynamo，先解决 session affinity、priority queueing、TTL 生命周期和 output load estimation。Advanced hints 继承 v1 中的 Sutradhara semantic phase 和 LMCache-style key 管理，让 scheduler 能做 semantic-driven cache policy optimization。
+Base hints 借鉴 Dynamo，先解决 session affinity、priority queueing、session lifecycle 和 output load estimation。Advanced hints 继承 v1 中的 Sutradhara semantic phase 和 LMCache-style key 管理，让 scheduler 能从 `semantic_spans.phase` 衍生 `phase_ttl_ms`、admission 和 pin 等缓存策略。
 
 最终形态是：
 
