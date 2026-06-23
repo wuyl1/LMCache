@@ -45,18 +45,43 @@ v2 的核心链路是：
               +---------------+---------------+
               |                               |
               v                               v
-+----------------------------+   +----------------------------+
-| Inference Workers          |   | UMBP                       |
-| SGLang / vLLM / others     |   |                            |
-|                            |   |                            |
-| - prefill / decode         |   | - match_external_kv()      |
-| - local KV cache           |   | - report / revoke metadata |
-| - expose KV layout / ptr   |   | - RoutePut / RouteGet      |
-| - consume fetched KV       |   | - batch_put/get ptr APIs   |
-|                            |   | - HBM / DRAM / SSD tier    |
-+----------------------------+   +----------------------------+
++----------------------------+       +----------------------------------+
+| Inference Workers          |       | UMBP                             |
+| SGLang / vLLM / others     |       |                                  |
+|                            |       | Existing data/index APIs:        |
+| - prefill / decode         |       | - match/report/revoke external KV|
+| - local KV cache           |       | - RoutePut / RouteGet            |
+| - expose KV layout / ptr   |       | - batch_put/get ptr APIs         |
+| - consume fetched KV       |       | - peer-owned tier storage        |
+|                            |       |                                  |
+|                            |       | Proposed agent-hint controls:    |
+|                            |       | - pin / unpin by key or block    |
+|                            |       | - demote / promote across tiers  |
+|                            |       | - evict / expire / update TTL    |
+|                            |       | - priority and admission policy  |
++-------------+--------------+       +----------------+-----------------+
+              |                                       ^
+              | metadata report: external KV hash,    |
+              | tier, node id, block metadata         |
+              +-------------------------------------->|
+              |                                       |
+              | put/get data path: canonical key,     |
+              | KV layout, src/dst pointer            |
+              +-------------------------------------->|
+              |                                       |
+              | fetched KV bytes copied into worker   |
+              | buffer; match result guides routing   |
+              |<--------------------------------------+
+              |                                       |
+              | local cache pressure / produced KV    |
+              | and block lifecycle events            |
+              +-------------------------------------->|
+                                                      |
+Scheduler -> UMBP policy API:
+  pin / demote / evict / update TTL / update priority
 
-Worker <---- KV metadata / ptr / transfer ----> UMBP
+UMBP -> Scheduler feedback:
+  policy result / matched candidates / tier state / pressure signal
 ```
 
 这个架构中，scheduler 是策略中枢：
@@ -64,7 +89,9 @@ Worker <---- KV metadata / ptr / transfer ----> UMBP
 - 它像 Dynamo Router 一样消费请求级 hints，做 routing、queueing、KV locality 和 session affinity。
 - 它也消费 advanced semantic hints，做更细粒度的 KV admission、TTL、priority、pin 和 eviction/tier 策略。
 - 推理 worker 和 UMBP 是 scheduler 下的两个同级执行子系统：worker 负责 prefill/decode 和本地 KV，UMBP 负责跨节点、跨 tier 的 KV 查询、搬运和托管。
-- UMBP 不直接解析 Agent 语义，只执行 scheduler 下发的 key、metadata 和缓存策略动作。
+- UMBP 的 master 更像 routing advisor，维护 external KV index 和 owned-key routing state；真正的 KV slot、page location、tier storage 和 eviction 由 peer 持有和执行。
+- v2 不局限于当前 UMBP 已有 API，而是把 UMBP 作为可协同演进的缓存子系统：保留现有 pointer-based data path 和 external metadata path，同时补齐 agent-hint-driven policy controls。
+- UMBP 不直接解析 Agent 语义，只执行 scheduler 下发的 opaque key、metadata 和缓存策略动作。
 
 ---
 
@@ -300,25 +327,49 @@ Scheduler decision
   ├── worker_action:
   │     ├── route request to selected worker
   │     ├── prefill / decode
-  │     ├── expose KV layout / ptr for reusable chunks
+  │     ├── expose KV layout / ptr for UMBP-owned chunks
+  │     ├── report locally-owned KV hashes when using metadata-only mode
   │     └── consume KV fetched from UMBP
   │
   └── umbp_action:
-        ├── match       -> UMBP match_external_kv()
-        ├── report      -> UMBP report_external_kv_blocks()
-        ├── revoke      -> UMBP revoke external metadata
-        ├── put         -> UMBP batch_put_from_ptr()
-        ├── get         -> UMBP batch_get_into_ptr()
-        ├── pin         -> UMBP mark protected / high priority until event or TTL
-        ├── demote      -> UMBP move HBM/DRAM -> SSD or cold tier
-        └── evict       -> UMBP release low-value KV
+        ├── metadata path:
+        │     ├── match  -> UMBP match_external_kv()
+        │     ├── report -> UMBP report_external_kv_blocks()
+        │     └── revoke -> UMBP revoke_external_kv_blocks()
+        │
+        └── owned-by-UMBP bytes path:
+              ├── put    -> UMBP batch_put_from_ptr()
+              ├── get    -> UMBP batch_get_into_ptr()
+              ├── policy -> priority / depth / TTL / tier hints
+              │
+              └── proposed policy controls:
+                    ├── pin    -> protect key/block until event or TTL
+                    ├── demote -> move key/block from hot tier to colder tier
+                    └── evict  -> release low-value key/block explicitly
 ```
 
 两边的职责边界保持清晰：
 
 - 推理 worker 负责模型执行、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
-- UMBP 根据 opaque key 做查找、搬运、托管、分层和回收。
+- UMBP metadata path 只维护 externally-owned KV 的 hash、tier、node 信息，用于 `match_external_kv()` 这类 advisory routing；这些 external KV blocks 不能通过 UMBP `ResolveKey` 直接读取 bytes。
+- UMBP-owned bytes path 使用 `batch_put_from_ptr()` / `batch_get_into_ptr()` 托管和取回 KV bytes；peer 持有真实 slot、page location、tier storage 和 eviction 状态。
+- `pin`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口，而不是当前源码已经稳定暴露的基础数据面接口。它们的作用是把 scheduler 从“只给 priority/TTL 建议”推进到“可以显式保护、降级和释放特定 KV”的闭环控制。
 - UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
+
+这三个新增接口建议保持 key/block-level，而不是 semantic-level：
+
+```text
+pin(key_or_block, until_event | ttl)
+  protect hot or event-critical KV from eviction
+
+demote(key_or_block, target_tier)
+  move reusable but cold KV from HBM/DRAM to SSD or remote tier
+
+evict(key_or_block, reason)
+  release KV that scheduler has classified as low-value or expired
+```
+
+Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `PARTIAL_PREFILL` 可以 pin 到 tool result 返回，`SYSTEM_PROMPT` 可以长期保留在热层，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier 和 TTL，不需要理解这些 phase 的语义。
 
 ---
 
@@ -480,7 +531,7 @@ Scheduler 做：
 - `SYSTEM_PROMPT` 优先 report/put
 - `RESPONSE` 默认 skip
 - `TOOL_OUTPUT` 根据 cacheable、大小、命中统计做 admission
-- `PARTIAL_PREFILL` 短 TTL / pin
+- `PARTIAL_PREFILL` 短 TTL；event pin 作为 scheduler 侧保护策略
 
 收益：
 
@@ -494,13 +545,14 @@ Scheduler 做：
 - 完整 canonical key
 - KV layout metadata
 - `batch_put_from_ptr()` / `batch_get_into_ptr()`
-- tier placement / demote / pin
+- tier placement / eviction priority / TTL policy hints
+- proposed `pin` / `demote` / `evict` policy controls
 
 Scheduler 做：
 
 - 只把高价值 KV 交给 UMBP 托管。
-- 根据 priority / TTL / phase 做 HBM/DRAM/SSD 分层。
-- 在事件结束或 TTL 到期后解除 pin、降级或释放。
+- 根据 priority / TTL / phase 影响 HBM/DRAM/SSD 分层和 eviction 顺序。
+- 在事件结束或 TTL 到期后调用 policy controls，允许 UMBP 降级、回收或撤销 metadata。
 
 收益：
 
