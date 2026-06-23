@@ -4,13 +4,15 @@
 
 v1 方案把核心组件设计成 **Semantic KV Adapter**：adapter 位于推理框架和 UMBP 之间，负责把 Agent 语义翻译成 `semantic spans`、`canonical key`、`priority / TTL` 和 `skip / report / put` 决策，再通过 UMBP API 与 UMBP 交互。
 
-v2 方案调整架构边界：**不再把 adapter 作为 UMBP 的主要交互层，而是让 scheduler 成为 agent hints 的消费方和策略决策方**。这更接近 NVIDIA Dynamo 的思路：上层通过请求级 hints 暴露 session、priority、输出长度、生命周期等信息，serving 层 scheduler/router 根据这些 hints 做路由、排队和 KV cache 策略优化。
+v2 方案重新划分控制面：**不再把 adapter 作为 UMBP 的主要交互层，而是让 scheduler 成为 agent hints 的消费方和策略决策方**。这更接近 NVIDIA Dynamo 的思路：上层通过请求级 hints 暴露 session、priority、输出长度和生命周期等信息，serving 层 scheduler/router 根据这些 hints 做路由、排队和 KV cache 策略优化。
+
+同时，v2 不把 UMBP 限定为当前已有接口的集合。它保留现有 external metadata path 和 pointer-based KV data path，同时提出面向 agent hints 的 policy control 扩展，让 scheduler 可以显式保护、降级、释放或调整 KV 的生命周期。
 
 v2 的目标是：
 
 1. **贴合现有软件架构**：系统已有 scheduler，缓存策略应由 scheduler 统一决策，而不是新增 adapter 分裂控制面。
 2. **分层接收 hints**：先支持稳定、容易生产的 base hints，再扩展到包含语义和 key 管理的 advanced hints。
-3. **让 UMBP 保持执行层定位**：UMBP 不理解 Agent 语义，只接收 scheduler 下发的 key、metadata 和策略动作。
+3. **协同扩展 UMBP 控制面**：UMBP 继续承担执行层职责，但可以新增 `pin / demote / evict / update TTL` 等 key/block-level policy controls。
 4. **围绕 semantic-driven cache policy optimization**：语义用于决定缓存价值、生命周期、准入和 eviction/pin 策略；复用安全仍由 token chunk、model、tokenizer、KV layout 和隔离字段保证。
 
 ---
@@ -21,7 +23,7 @@ v2 的核心链路是：
 
 ```text
 +------------------------------------------------------------+
-| Agent / Workflow Orchestrator / Harness                    |
+| Agent / Harness / Workflow Orchestrator                    |
 |                                                            |
 | base hints: session_id / workflow_id / ttl / priority      |
 | advanced:   semantic spans / reuse_scope / key fields      |
@@ -84,11 +86,11 @@ UMBP -> Scheduler feedback:
   policy result / matched candidates / tier state / pressure signal
 ```
 
-这个架构中，scheduler 是策略中枢：
+这个架构中，scheduler 是策略中枢，worker 和 UMBP 是并行执行子系统：
 
 - 它像 Dynamo Router 一样消费请求级 hints，做 routing、queueing、KV locality 和 session affinity。
 - 它也消费 advanced semantic hints，做更细粒度的 KV admission、TTL、priority、pin 和 eviction/tier 策略。
-- 推理 worker 和 UMBP 是 scheduler 下的两个同级执行子系统：worker 负责 prefill/decode 和本地 KV，UMBP 负责跨节点、跨 tier 的 KV 查询、搬运和托管。
+- 推理 worker 负责 prefill/decode、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
 - UMBP 的 master 更像 routing advisor，维护 external KV index 和 owned-key routing state；真正的 KV slot、page location、tier storage 和 eviction 由 peer 持有和执行。
 - v2 不局限于当前 UMBP 已有 API，而是把 UMBP 作为可协同演进的缓存子系统：保留现有 pointer-based data path 和 external metadata path，同时补齐 agent-hint-driven policy controls。
 - UMBP 不直接解析 Agent 语义，只执行 scheduler 下发的 opaque key、metadata 和缓存策略动作。
@@ -135,7 +137,7 @@ base:
 - `expected_output_tokens` 帮助 scheduler 估算 decode 阶段的 KV 增长和 worker 未来负载。
 - `session_action` / `session_timeout_ms` 支持 session open/close、subagent 生命周期和自动清理。
 
-Base hints 的特点是：**即使没有 token span 级语义，也能带来 routing locality、session isolation、priority queueing 和生命周期控制收益**。
+Base hints 的价值在于低门槛：即使没有 token span 级语义，scheduler 也能先获得 routing locality、session isolation、priority queueing 和生命周期控制收益。
 
 ### 3.2 Advanced Hints
 
@@ -168,14 +170,14 @@ advanced:
     admission            # skip / report / put，可由上层建议，也可由 scheduler 决定
 ```
 
-Advanced hints 的核心作用：
+Advanced hints 在 base hints 之上提供缓存价值判断和安全复用所需的信息：
 
 - **语义价值识别**：识别 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`RESPONSE` 等不同 KV 的复用价值。
-- **语义生命周期策略**：把 phase 转成 TTL、priority、pin。
+- **语义生命周期策略**：把 phase 转成 TTL、priority、pin 或 demote/evict 策略。
 - **语义安全复用**：把 phase、reuse scope、tenant/session 与 LMCache-style token chunk key 结合，避免“语义相似”导致错复用。
 - **语义准入控制**：决定 chunk 是 `skip`、`report` 还是 `put`。
 
-Advanced hints 不是一开始必须全部具备。没有显式 semantic spans 时，scheduler 可以根据 message role、tool event 和默认规则生成保守 phase；没有完整 key_identity 时，只允许 metadata-only routing，不进入 UMBP-owned KV bytes 托管。
+Advanced hints 不要求一次性全部具备。没有显式 semantic spans 时，scheduler 可以根据 message role、tool event 和默认规则生成保守 phase；没有完整 key_identity 时，只允许 metadata-only routing，不进入 UMBP-owned KV bytes 托管。
 
 ---
 
@@ -217,7 +219,7 @@ queue_order = (strict_priority, policy_score(priority, arrival_time, token_cost)
 - 长 prefill、低优先级请求可延后或降级。
 - 对 latency-sensitive 请求提高 routing 和 cache retrieval 优先级。
 
-`priority` 也可以传给 UMBP 作为 eviction/tier policy hint：
+`priority` 也可以作为 UMBP policy hint，用来影响 tier placement 和 eviction 顺序：
 
 - 高 priority KV 优先保留在 HBM/DRAM。
 - 低 priority KV 更早下沉到 SSD 或被撤销 metadata。
@@ -240,11 +242,11 @@ estimated_output_blocks = ceil(expected_output_tokens / block_size)
 
 Base `ttl_ms` 和 advanced `phase_ttl_ms` 都是生命周期 hint。
 
-Scheduler 可以做：
+Scheduler 可以把 TTL 转成不同所有权模式下的动作：
 
 - metadata-only 模式下，TTL 到期后 revoke external KV metadata。
-- UMBP-owned 模式下，TTL 到期后降低 priority、迁移到冷 tier 或释放。
-- event-based pin 缺失时，用 TTL 作为兜底，避免无限 pin。
+- UMBP-owned 模式下，TTL 到期后降低 priority、迁移到冷 tier，或通过 proposed policy controls 显式释放。
+- event-based pin 缺失时，用 TTL 作为兜底，避免 KV 被无限保护。
 
 示例：
 
@@ -285,8 +287,8 @@ put:
 - `SYSTEM_PROMPT`：默认 report；高命中或全局共享前缀可 put。
 - `USER_QUERY`：session-scoped、短 TTL，通常 report，不长期 put。
 - `TOOL_OUTPUT`：根据大小、cacheable hint 和命中统计决定；大且低命中时 skip 或 report。
-- `PARTIAL_PREFILL`：短 TTL，可 pin 到工具返回。
-- `RESPONSE`：默认 skip-save，不 report、不 put。
+- `PARTIAL_PREFILL`：短 TTL，可保护到工具返回。
+- `RESPONSE`：默认 skip，不 report、不 put。
 - `UNKNOWN`：保守处理，skip 或短 TTL report。
 
 ### 4.6 Canonical Key 生成与安全复用
@@ -348,15 +350,16 @@ Scheduler decision
                     └── evict  -> release low-value key/block explicitly
 ```
 
-两边的职责边界保持清晰：
+这里要保持三条边界清晰：
 
 - 推理 worker 负责模型执行、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
-- UMBP metadata path 只维护 externally-owned KV 的 hash、tier、node 信息，用于 `match_external_kv()` 这类 advisory routing；这些 external KV blocks 不能通过 UMBP `ResolveKey` 直接读取 bytes。
+- UMBP metadata path 只维护 externally-owned KV 的 hash、tier、node 信息，用于 `match_external_kv()` 这类 advisory routing；这些 external KV blocks 不能通过 UMBP 的 owned-key data path 直接读取 bytes。
 - UMBP-owned bytes path 使用 `batch_put_from_ptr()` / `batch_get_into_ptr()` 托管和取回 KV bytes；peer 持有真实 slot、page location、tier storage 和 eviction 状态。
-- `pin`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口，而不是当前源码已经稳定暴露的基础数据面接口。它们的作用是把 scheduler 从“只给 priority/TTL 建议”推进到“可以显式保护、降级和释放特定 KV”的闭环控制。
 - UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
 
-这三个新增接口建议保持 key/block-level，而不是 semantic-level：
+在这个基础上，`pin`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口。它们不是当前源码已经稳定暴露的基础数据面接口，而是把 scheduler 从“只给 priority/TTL 建议”推进到“可以显式保护、降级和释放特定 KV”的闭环控制。
+
+这类新增接口建议保持 key/block-level，而不是 semantic-level：
 
 ```text
 pin(key_or_block, until_event | ttl)
@@ -369,7 +372,7 @@ evict(key_or_block, reason)
   release KV that scheduler has classified as low-value or expired
 ```
 
-Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `PARTIAL_PREFILL` 可以 pin 到 tool result 返回，`SYSTEM_PROMPT` 可以长期保留在热层，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier 和 TTL，不需要理解这些 phase 的语义。
+Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `PARTIAL_PREFILL` 可以保护到 tool result 返回，`SYSTEM_PROMPT` 可以长期保留在热层，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、TTL 和 priority，不需要理解这些 phase 的业务语义。
 
 ---
 
@@ -385,9 +388,9 @@ PARTIAL_PREFILL: 等待 SQL 时已 prefill 的工具无关上下文
 RESPONSE:       最终中文报告
 ```
 
-### 6.1 上层产生 hints
+### 6.1 上层产生并携带 hints
 
-Harness / Orchestrator / LLM Provider 可以产生 base hints：
+Agent、Harness 或 Workflow Orchestrator 可以产生 base hints；LLM Provider / Engine Connector 负责把这些 hints 连同请求、tokens 和 KV layout metadata 一起传给 scheduler：
 
 ```json
 {
@@ -404,7 +407,7 @@ Harness / Orchestrator / LLM Provider 可以产生 base hints：
 }
 ```
 
-如果上层有更丰富语义，也可以提供 advanced hints：
+如果上层有更丰富的语义上下文，也可以提供 advanced hints：
 
 ```json
 {
@@ -442,7 +445,7 @@ Harness / Orchestrator / LLM Provider 可以产生 base hints：
 
 ### 6.2 Scheduler 决策
 
-Scheduler 根据 hints 做策略：
+Scheduler 把 hints 转成 admission、routing、tier 和 lifecycle 策略：
 
 ```text
 SYSTEM_PROMPT:
@@ -471,7 +474,7 @@ RESPONSE:
 
 ### 6.3 UMBP 执行
 
-Scheduler 调用 UMBP：
+Scheduler 再把策略落到 UMBP 的 metadata path、bytes path 和 proposed policy controls：
 
 ```text
 1. match_external_kv(system_prompt_key)
@@ -483,11 +486,11 @@ Scheduler 调用 UMBP：
 3. batch_put_from_ptr(system_prompt_key, kv_ptr)
    -> 对高命中系统提示词，交给 UMBP 托管。
 
-4. revoke 或 TTL 到期降级
-   -> 对短期 user query / tool output，避免长期污染热层。
+4. pin / demote / evict / update TTL
+   -> 对高价值 KV 做事件级保护，对短期 user query / tool output 到期降级或释放。
 ```
 
-这个例子的重点是：**scheduler 直接把 hints 转成 UMBP 动作**。UMBP 不需要知道“报表”或“SQL”的业务含义，只执行 key、metadata 和 policy。
+这个例子的重点是：**scheduler 直接把 hints 转成 UMBP 动作**。UMBP 不需要知道“报表”或“SQL”的业务含义，只执行 key、metadata、tier 和 policy controls。
 
 ---
 
@@ -516,6 +519,7 @@ Scheduler 做：
 
 - 低风险，不改变 KV bytes 所有权。
 - 先获得 Dynamo 风格的 KV locality 和 routing 收益。
+- 为后续 policy controls 积累命中率、生命周期和 tier 状态数据。
 
 ### 阶段二：Advanced Semantic Admission
 
@@ -538,7 +542,7 @@ Scheduler 做：
 - 减少 cache 污染。
 - 让高价值 KV 更稳定保留。
 
-### 阶段三：UMBP-owned KV 与 Tier Policy
+### 阶段三：UMBP-owned KV 与 Policy Controls
 
 加入：
 
@@ -563,11 +567,11 @@ Scheduler 做：
 
 ## 8. 设计原则
 
-1. **Scheduler owns policy, UMBP executes.** Scheduler 消费 hints 并做策略决策；UMBP 执行 key、metadata 和 tier 操作。
+1. **Scheduler owns policy, UMBP executes.** Scheduler 消费 hints 并做策略决策；UMBP 执行 key、metadata、data movement 和 tier 操作。
 2. **Base first, advanced later.** 先落地稳定请求级 hints，再引入 token span 级语义。
 3. **Hints are soft.** Scheduler 可以接受、裁剪、忽略或降级 hints，避免上层无限 pin 或污染缓存。
 4. **Semantic value is not reuse correctness.** 语义决定缓存价值和生命周期；canonical key 决定能否安全复用。
-5. **No semantic logic in UMBP core.** UMBP core 不解析 prompt，不理解业务语义，只消费 scheduler 下发的 opaque key 和轻量 metadata。
+5. **Extend UMBP at key/block level.** 新增 policy controls 应围绕 opaque key、block id、TTL、priority 和 tier，不把 Agent 语义下沉到 UMBP core。
 
 ---
 
@@ -580,9 +584,10 @@ Base hints 借鉴 Dynamo，先解决 session affinity、priority queueing、TTL 
 最终形态是：
 
 ```text
-Agent / Orchestrator 产生 hints
+Agent / Harness / Workflow Orchestrator 产生 hints
+LLM Provider / Engine Connector 携带 hints 进入 serving 层
 Scheduler 消费 hints 并决策缓存策略
-UMBP 执行 key-based routing、storage、tiering、eviction
+UMBP 执行 key-based routing、storage、tiering 和 policy controls
 ```
 
-这样既贴合现有 scheduler 架构，也避免让 UMBP core 承担 Agent 语义理解。
+这样既贴合现有 scheduler 架构，也为 UMBP 补齐 agent-hint-driven cache optimization 所需的控制面，同时避免让 UMBP core 承担 Agent 语义理解。
