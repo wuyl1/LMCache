@@ -55,9 +55,8 @@ v2 的核心链路是：
 | - consume fetched KV       |   | - batch_put/get ptr APIs   |
 |                            |   | - HBM / DRAM / SSD tier    |
 +----------------------------+   +----------------------------+
-              ^                               ^
-              |                               |
-              +------ KV metadata / ptr / transfer -----------+
+
+Worker <---- KV metadata / ptr / transfer ----> UMBP
 ```
 
 这个架构中，scheduler 是策略中枢：
@@ -441,23 +440,7 @@ Scheduler 调用 UMBP：
 
 ---
 
-## 7. 与 v1 的差异
-
-| 维度 | v1：Semantic KV Adapter | v2：Scheduler-driven Agent Hints |
-|---|---|---|
-| 策略中枢 | Adapter | Scheduler |
-| 与 UMBP 交互 | Adapter 调 UMBP API | Scheduler 直接调 UMBP API |
-| 架构风格 | 更像 LMCache connector / translation layer | 更像 Dynamo router/scheduler consuming hints |
-| Hint 分层 | 主要围绕 semantic spans、key、admission | base + advanced 两层 |
-| Base 能力 | 没有单独突出 | session、TTL、priority、OSL、workflow lifecycle |
-| Advanced 能力 | Sutradhara phase + LMCache key | 继承 v1 语义和 key 管理，但由 scheduler 消费 |
-| UMBP 定位 | Adapter 背后的 KV 执行层 | 与推理 worker 平级，都是 scheduler 调度的执行子系统 |
-
-v2 不否定 v1 的语义和 key 管理内容，而是改变控制面位置：**语义和 key 管理仍然需要，但不再由单独 adapter 主导，而是并入 scheduler 的缓存策略决策。**
-
----
-
-## 8. 落地阶段
+## 7. 落地阶段
 
 ### 阶段一：Base Hints + Metadata-only Routing
 
@@ -526,7 +509,7 @@ Scheduler 做：
 
 ---
 
-## 9. 设计原则
+## 8. 设计原则
 
 1. **Scheduler owns policy, UMBP executes.** Scheduler 消费 hints 并做策略决策；UMBP 执行 key、metadata 和 tier 操作。
 2. **Base first, advanced later.** 先落地稳定请求级 hints，再引入 token span 级语义。
@@ -536,7 +519,7 @@ Scheduler 做：
 
 ---
 
-## 10. 小结
+## 9. 小结
 
 UMBP Agent Hints v2 的核心变化是：**从 adapter-centric 改为 scheduler-centric**。
 
