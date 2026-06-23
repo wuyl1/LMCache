@@ -23,15 +23,15 @@ v2 的核心链路是：
 
 ```text
 +------------------------------------------------------------+
-| Agent / Harness / Workflow Orchestrator                    |
+| Agent / Harness / Agent Orchestrator                       |
 |                                                            |
-| base hints: session_id / workflow_id / ttl / priority      |
+| base hints: session_id / ttl / priority                    |
 | advanced:   semantic spans / reuse_scope / key fields      |
 +-----------------------------+------------------------------+
                               |
                               v
 +------------------------------------------------------------+
-| LLM Provider / Engine Connector                            |
+| Request Frontend                                           |
 |                                                            |
 | attach hints with request, tokens, and KV layout metadata   |
 +-----------------------------+------------------------------+
@@ -90,6 +90,7 @@ UMBP -> Scheduler feedback:
 
 - 它像 Dynamo Router 一样消费请求级 hints，做 routing、queueing、KV locality 和 session affinity。
 - 它也消费 advanced semantic hints，做更细粒度的 KV admission、TTL、priority、pin 和 eviction/tier 策略。
+- Request Frontend 对应 Dynamo 中的 `dynamo.frontend` 职责：接收 OpenAI/Anthropic-compatible 请求，解析 hints 和 session metadata，并把请求交给 scheduler/router。
 - 推理 worker 负责 prefill/decode、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
 - UMBP 的 master 更像 routing advisor，维护 external KV index 和 owned-key routing state；真正的 KV slot、page location、tier storage 和 eviction 由 peer 持有和执行。
 - v2 不局限于当前 UMBP 已有 API，而是把 UMBP 作为可协同演进的缓存子系统：保留现有 pointer-based data path 和 external metadata path，同时补齐 agent-hint-driven policy controls。
@@ -117,14 +118,13 @@ Base hints 参考 Dynamo 的 `nvext.agent_hints` 和 `nvext.session_control` 思
 base:
   request_id              # 单次请求标识，用于 tracing，不作为 KV identity
   session_id              # 会话标识，用于 sticky routing、session-scoped reuse、生命周期管理
-  workflow_id             # workflow / agent run 标识，用于关联同一任务轨迹
   tenant_id               # 租户隔离
   priority                # 请求或缓存保留优先级
   strict_priority         # 可选，强优先级层级
   ttl_ms                  # 请求相关 KV 的默认生命周期
   expected_output_tokens  # 类似 Dynamo osl，用于输出 KV block 负载估计
   expected_next_call_ms   # 类似 iat，用于估计下一轮请求间隔
-  total_expected_calls    # 类似 total_requests，用于估计 workflow 剩余生命周期
+  total_expected_calls    # 类似 total_requests，用于估计会话或 agent run 剩余生命周期
   session_action          # open / bind / close
   session_timeout_ms      # session inactivity timeout
 ```
@@ -166,7 +166,7 @@ advanced:
   policy:
     phase_priority
     phase_ttl_ms
-    pin_until_event      # tool_returned / workflow_step_done / session_close
+    pin_until_event      # tool_returned / agent_step_done / session_close
     admission            # skip / report / put，可由上层建议，也可由 scheduler 决定
 ```
 
@@ -187,7 +187,7 @@ Scheduler 是 v2 的核心策略层。它不只是排队组件，而是 agent hi
 
 ### 4.1 Routing 与 Session Affinity
 
-Base hints 中的 `session_id`、`workflow_id` 和 `tenant_id` 用于 routing：
+Base hints 中的 `session_id` 和 `tenant_id` 用于 routing：
 
 ```text
 if session_id has sticky worker:
@@ -302,7 +302,7 @@ cache_key = hash(
     kv_layout_version,
     token_chunk_hash,
     tenant_id,
-    session_id or workflow_id,
+    session_id,
     reuse_scope,
     phase,
     cache_salt
@@ -390,13 +390,12 @@ RESPONSE:       最终中文报告
 
 ### 6.1 上层产生并携带 hints
 
-Agent、Harness 或 Workflow Orchestrator 可以产生 base hints；LLM Provider / Engine Connector 负责把这些 hints 连同请求、tokens 和 KV layout metadata 一起传给 scheduler：
+Agent、Harness 或 Agent Orchestrator 可以产生 base hints；Request Frontend 负责把这些 hints 连同请求、tokens 和 KV layout metadata 一起传给 scheduler：
 
 ```json
 {
   "base": {
     "session_id": "report-task-001",
-    "workflow_id": "sales-report-agent",
     "tenant_id": "tenant-a",
     "priority": 5,
     "ttl_ms": 300000,
@@ -462,7 +461,7 @@ USER_QUERY:
 
 TOOL_OUTPUT:
   - 如果 cacheable=false 或过大且低命中，admission = skip
-  - 如果后续 workflow 会复用，admission = report 或 put
+  - 如果后续请求或 agent step 会复用，admission = report 或 put
 
 PARTIAL_PREFILL:
   - pin_until_event = tool_returned
@@ -481,7 +480,7 @@ Scheduler 再把策略落到 UMBP 的 metadata path、bytes path 和 proposed po
    -> 如果已有 worker 持有系统提示词 KV，优先路由过去。
 
 2. report_external_kv_blocks(system_prompt_key, worker, tier, metadata)
-   -> 后续同 workflow 请求可以通过 UMBP 找到已有 KV。
+   -> 后续同 session 请求可以通过 UMBP 找到已有 KV。
 
 3. batch_put_from_ptr(system_prompt_key, kv_ptr)
    -> 对高命中系统提示词，交给 UMBP 托管。
@@ -584,8 +583,8 @@ Base hints 借鉴 Dynamo，先解决 session affinity、priority queueing、TTL 
 最终形态是：
 
 ```text
-Agent / Harness / Workflow Orchestrator 产生 hints
-LLM Provider / Engine Connector 携带 hints 进入 serving 层
+Agent / Harness / Agent Orchestrator 产生 hints
+Request Frontend 携带 hints 进入 serving 层
 Scheduler 消费 hints 并决策缓存策略
 UMBP 执行 key-based routing、storage、tiering 和 policy controls
 ```
