@@ -36,27 +36,29 @@ Scheduler
         │
         │  统一决策：
         │  - route 到哪个 worker
-        │  - 是否 report external KV metadata
-        │  - 是否 put KV bytes 到 UMBP
+        │  - 是否从 UMBP 取回或预取 KV
+        │  - 是否向 UMBP report / put / revoke KV
         │  - TTL / priority / pin / eviction / tier placement
-        ▼
-UMBP
         │
-        │  执行动作：
-        │  - match_external_kv()
-        │  - report / revoke external KV metadata
-        │  - RoutePut / RouteGet
-        │  - batch_put_from_ptr() / batch_get_into_ptr()
-        │  - HBM / DRAM / SSD tier 管理
-        ▼
-SGLang / vLLM / Other Workers
+        ├───────────────────────────────┐
+        ▼                               ▼
+SGLang / vLLM / Other Workers          UMBP
+        │                               │
+        │  推理执行：                   │  KV 执行：
+        │  - prefill / decode           │  - match_external_kv()
+        │  - 本地 KV cache              │  - report / revoke external metadata
+        │  - 暴露 KV layout / ptr       │  - RoutePut / RouteGet
+        │  - 消费取回的 KV              │  - batch_put_from_ptr() / batch_get_into_ptr()
+        │                               │  - HBM / DRAM / SSD tier 管理
+        └──────────── KV metadata / ptr / transfer ────────────┘
 ```
 
 这个架构中，scheduler 是策略中枢：
 
 - 它像 Dynamo Router 一样消费请求级 hints，做 routing、queueing、KV locality 和 session affinity。
 - 它也消费 advanced semantic hints，做更细粒度的 KV admission、TTL、priority、pin 和 eviction/tier 策略。
-- UMBP 只执行 scheduler 的决策，不直接解析 Agent 语义。
+- 推理 worker 和 UMBP 是 scheduler 下的两个同级执行子系统：worker 负责 prefill/decode 和本地 KV，UMBP 负责跨节点、跨 tier 的 KV 查询、搬运和托管。
+- UMBP 不直接解析 Agent 语义，只执行 scheduler 下发的 key、metadata 和缓存策略动作。
 
 ---
 
@@ -283,27 +285,34 @@ cache_key = hash(
 
 ---
 
-## 5. Scheduler 到 UMBP 的动作接口
+## 5. Scheduler 调度 UMBP 与推理 Worker
 
-v2 中 scheduler 直接驱动 UMBP，而不是通过 adapter：
+v2 中 scheduler 同时驱动推理 worker 和 UMBP，而不是通过 adapter 间接控制 UMBP：
 
 ```text
 Scheduler decision
-  ├── match       -> UMBP match_external_kv()
-  ├── report      -> UMBP report_external_kv_blocks()
-  ├── revoke      -> UMBP revoke external metadata
-  ├── put         -> UMBP batch_put_from_ptr()
-  ├── get         -> UMBP batch_get_into_ptr()
-  ├── pin         -> UMBP mark protected / high priority until event or TTL
-  ├── demote      -> UMBP move HBM/DRAM -> SSD or cold tier
-  └── evict       -> UMBP release low-value KV
+  ├── worker_action:
+  │     ├── route request to selected worker
+  │     ├── prefill / decode
+  │     ├── expose KV layout / ptr for reusable chunks
+  │     └── consume KV fetched from UMBP
+  │
+  └── umbp_action:
+        ├── match       -> UMBP match_external_kv()
+        ├── report      -> UMBP report_external_kv_blocks()
+        ├── revoke      -> UMBP revoke external metadata
+        ├── put         -> UMBP batch_put_from_ptr()
+        ├── get         -> UMBP batch_get_into_ptr()
+        ├── pin         -> UMBP mark protected / high priority until event or TTL
+        ├── demote      -> UMBP move HBM/DRAM -> SSD or cold tier
+        └── evict       -> UMBP release low-value KV
 ```
 
-UMBP 的职责保持简单：
+两边的职责边界保持清晰：
 
-- 根据 opaque key 做查找和路由。
-- 根据 scheduler 给出的 priority、TTL、tier hint 做分层和回收。
-- 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
+- 推理 worker 负责模型执行、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
+- UMBP 根据 opaque key 做查找、搬运、托管、分层和回收。
+- UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
 
 ---
 
@@ -435,7 +444,7 @@ Scheduler 调用 UMBP：
 | Hint 分层 | 主要围绕 semantic spans、key、admission | base + advanced 两层 |
 | Base 能力 | 没有单独突出 | session、TTL、priority、OSL、workflow lifecycle |
 | Advanced 能力 | Sutradhara phase + LMCache key | 继承 v1 语义和 key 管理，但由 scheduler 消费 |
-| UMBP 定位 | Adapter 背后的 KV 执行层 | Scheduler 背后的 KV 执行层 |
+| UMBP 定位 | Adapter 背后的 KV 执行层 | 与推理 worker 平级，都是 scheduler 调度的执行子系统 |
 
 v2 不否定 v1 的语义和 key 管理内容，而是改变控制面位置：**语义和 key 管理仍然需要，但不再由单独 adapter 主导，而是并入 scheduler 的缓存策略决策。**
 
