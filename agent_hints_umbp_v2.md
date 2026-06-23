@@ -20,37 +20,44 @@ v2 的目标是：
 v2 的核心链路是：
 
 ```text
-Agent / Workflow Orchestrator / Harness
-        │
-        │  base hints:
-        │  - session_id / workflow_id / ttl_ms / priority / expected_output_tokens
-        │
-        │  advanced hints:
-        │  - semantic phase / semantic spans / reuse_scope / canonical key fields
-        ▼
-LLM Provider / Engine Connector
-        │
-        │  将 hints 随请求、tokens、KV layout metadata 一起传给 scheduler
-        ▼
-Scheduler
-        │
-        │  统一决策：
-        │  - route 到哪个 worker
-        │  - 是否从 UMBP 取回或预取 KV
-        │  - 是否向 UMBP report / put / revoke KV
-        │  - TTL / priority / pin / eviction / tier placement
-        │
-        ├───────────────────────────────┐
-        ▼                               ▼
-SGLang / vLLM / Other Workers          UMBP
-        │                               │
-        │  推理执行：                   │  KV 执行：
-        │  - prefill / decode           │  - match_external_kv()
-        │  - 本地 KV cache              │  - report / revoke external metadata
-        │  - 暴露 KV layout / ptr       │  - RoutePut / RouteGet
-        │  - 消费取回的 KV              │  - batch_put_from_ptr() / batch_get_into_ptr()
-        │                               │  - HBM / DRAM / SSD tier 管理
-        └──────────── KV metadata / ptr / transfer ────────────┘
++------------------------------------------------------------+
+| Agent / Workflow Orchestrator / Harness                    |
+|                                                            |
+| base hints: session_id / workflow_id / ttl / priority      |
+| advanced:   semantic spans / reuse_scope / key fields      |
++-----------------------------+------------------------------+
+                              |
+                              v
++------------------------------------------------------------+
+| LLM Provider / Engine Connector                            |
+|                                                            |
+| attach hints with request, tokens, and KV layout metadata   |
++-----------------------------+------------------------------+
+                              |
+                              v
++------------------------------------------------------------+
+| Scheduler                                                  |
+|                                                            |
+| decide route / prefetch / report / put / revoke / tiering  |
+| decide TTL / priority / pin / eviction                     |
++-----------------------------+------------------------------+
+                              |
+              +---------------+---------------+
+              |                               |
+              v                               v
++----------------------------+   +----------------------------+
+| Inference Workers          |   | UMBP                       |
+| SGLang / vLLM / others     |   |                            |
+|                            |   |                            |
+| - prefill / decode         |   | - match_external_kv()      |
+| - local KV cache           |   | - report / revoke metadata |
+| - expose KV layout / ptr   |   | - RoutePut / RouteGet      |
+| - consume fetched KV       |   | - batch_put/get ptr APIs   |
+|                            |   | - HBM / DRAM / SSD tier    |
++----------------------------+   +----------------------------+
+              ^                               ^
+              |                               |
+              +------ KV metadata / ptr / transfer -----------+
 ```
 
 这个架构中，scheduler 是策略中枢：
