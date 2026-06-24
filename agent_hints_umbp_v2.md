@@ -127,8 +127,15 @@ base:
 
 - `session_id` 让 scheduler 做 sticky session routing，减少同一会话 KV 在 worker 间漂移。
 - `priority` 影响 scheduler queue ordering、UMBP eviction/tier 策略。
-- `expected_output_tokens` 帮助 scheduler 估算 decode 阶段的 KV 增长和 worker 未来负载。
+- `expected_output_tokens` 告诉 scheduler 这条请求未来 decode 阶段大概会占多少 KV / GPU cache / worker 时间，用于估算输出 KV 增长和 worker 未来负载。
 - `session_action` / `session_timeout_ms` 支持 session open/close、subagent 生命周期和自动清理。
+
+`expected_output_tokens` 可以由上层近似估算，不要求精确：
+
+- 如果只有 `max_tokens`，可以把它作为保守上界。
+- 如果 harness 知道任务类型，可以给默认值，例如 SQL 查询较短、最终报告较长。
+- 如果系统有历史统计，可以使用同类请求的 p50 / p90 输出长度。
+- 如果 Agent 明确知道当前步骤只是在规划、查询或写最终报告，可以直接声明对应估计值。
 
 Base 层的生命周期语义应贴近 Dynamo 的 `session_control.timeout`：`session_timeout_ms` 表示 session 多久不活跃后可以关闭，用于 sticky routing、session KV isolation 和清理。它不是某个 semantic span 或 KV block 的缓存 TTL。
 
@@ -161,10 +168,9 @@ req1: 用户请求“分析数据库里的销售异常并生成报告”，主 A
     expected_output_tokens = 256
   scheduler decisions:
     - decide route: 查找系统提示词或报告模板 KV overlap，结合当前负载和预计 decode 负载选择 worker-A，并建立 report-main -> worker-A sticky binding
-    - session lifecycle: session_action=bind 只做路由亲和，不创建后端 streaming session slot
-    - session lifecycle: session_timeout_ms=long 表示 report-main 长时间不活跃后才兜底清理
+    - session lifecycle: session_action=bind 只做路由亲和，不创建后端 streaming session slot；session_timeout_ms=long 表示 report-main 长时间不活跃后才兜底清理
     - priority queueing: priority=5 表示这是用户可见的交互式报告任务，排队时优先于后台低优先级任务
-    - decode load estimate: expected_output_tokens=256 表示这一轮主要做任务规划，decode 负载较小
+    - decode load estimate: 将 expected_output_tokens=256 转成较小的未来 decode/KV 负载，避免过度惩罚 worker-A
 
 req2: 主 Agent 委派 SQL subagent 查询销售表，生成并执行销售异常查询
   hints:
@@ -175,10 +181,9 @@ req2: 主 Agent 委派 SQL subagent 查询销售表，生成并执行销售异�
     expected_output_tokens = 512
   scheduler decisions:
     - decide route: 查找系统提示词、数据库 schema 或工具说明 KV overlap，结合当前负载和预计 decode 负载选择 worker-B，并建立 report-sql-subagent -> worker-B sticky binding
-    - session lifecycle: session_action=open 触发后端 session slot，用于 SQL subagent 的 KV 隔离
-    - session lifecycle: session_timeout_ms=short 表示 SQL session 短时间不活跃即可兜底清理
+    - session lifecycle: session_action=open 触发后端 session slot，用于 SQL subagent 的 KV 隔离；session_timeout_ms=short 表示 SQL session 短时间不活跃即可兜底清理
     - priority queueing: priority=6 表示 SQL 结果阻塞最终报告，可在队列中略高于主 Agent 的普通整理轮次
-    - decode load estimate: expected_output_tokens=512 帮助 scheduler 估算 SQL 生成和结果解释带来的 decode KV 增长
+    - decode load estimate: 将 expected_output_tokens=512 计入 worker-B 的未来 decode/KV 负载，避免继续向已拥塞 worker 分配长输出请求
     - 此时 report-main 仍然存在；两条 session 生命周期并存
 
 req3: SQL subagent 把异常销售数据和解释返回给主 Agent，结束 SQL 子任务
@@ -193,7 +198,7 @@ req3: SQL subagent 把异常销售数据和解释返回给主 Agent，结束 SQL
     - session lifecycle: session_action=close 解除 sticky binding，关闭后端 session slot
     - session lifecycle: 释放 SQL subagent 的 session-scoped KV；timeout 不再重要
     - priority queueing: priority=6 让这个阻塞主报告的收尾请求不要被后台任务拖延
-    - decode load estimate: expected_output_tokens=128 表示这轮只返回整理后的 SQL 结论，预计输出较短
+    - decode load estimate: 将 expected_output_tokens=128 计入未来 decode/KV 负载；由于增量较小，对 worker 选择影响较弱
 
 req4: 另一个后台任务请求生成历史销售日志摘要，用于离线归档，不阻塞当前报告
   hints:
@@ -206,7 +211,7 @@ req4: 另一个后台任务请求生成历史销售日志摘要，用于离线�
     - decide route: 根据 session_id 建立 background-summary 的 sticky binding
     - session lifecycle: session_action=bind 只做路由亲和，不创建后端 session slot
     - priority queueing: priority=1 表示后台低优先级任务；当它与 report-main 或 report-sql-subagent 同时排队时，scheduler 优先处理 priority=5/6 的报告链路
-    - decode load estimate: expected_output_tokens=1024 表示后台摘要可能生成较长输出，scheduler 可以把它的未来 decode 负载计入 worker 选择
+    - decode load estimate: 将 expected_output_tokens=1024 计入未来 decode/KV 负载；即使 priority 较低，也避免把长后台输出压到已拥塞 worker
 
 req5: 主 Agent 接收 SQL 结果，整理异常原因、影响范围和报告结构
   hints:
@@ -217,10 +222,9 @@ req5: 主 Agent 接收 SQL 结果，整理异常原因、影响范围和报告�
     expected_output_tokens = 512
   scheduler decisions:
     - decide route: session_id 命中 req1 建立的 report-main binding，继续回到 worker-A；若只命中 UMBP metadata 且 worker-A 没有 KV bytes，可触发 UMBP v2 data path prefetch，例如从 L3 / remote tier 预取 KV 到 worker-A 的 L1 / GPU KV cache
-    - session lifecycle: session_action 省略表示继续已有 main session，不重新 bind/open
-    - session lifecycle: 沿用 long timeout 语义，并刷新 inactivity 计时窗口
+    - session lifecycle: session_action 省略表示继续已有 main session，不重新 bind/open；沿用 long timeout 语义，并刷新 inactivity 计时窗口
     - priority queueing: priority=5 延续用户可见报告任务的排队优先级
-    - decode load estimate: expected_output_tokens=512 表示这一轮主要整理结构，输出长度中等
+    - decode load estimate: 将 expected_output_tokens=512 计入 worker-A 的未来 decode/KV 负载，用于后续 route/queue 判断
 
 req6: 主 Agent 生成最终报告；如果任务不再继续，关闭主 Agent session
   hints:
@@ -234,7 +238,7 @@ req6: 主 Agent 生成最终报告；如果任务不再继续，关闭主 Agent 
     - session lifecycle: session_action=close 结束 report-main 的 sticky binding
     - session lifecycle: 如果后端曾为该 session 管理 session-scoped KV，也在这里释放
     - priority queueing: priority=5 用于最终响应的排队；close 仍由 session_action 控制
-    - decode load estimate: expected_output_tokens=2048 表示最终报告输出较长，scheduler 应把较大的 decode KV / GPU cache 占用纳入负载估计
+    - decode load estimate: 将 expected_output_tokens=2048 转成较大的未来 decode/KV 负载，scheduler 可据此选择 decode 压力更低的 worker 或延后派发
 
 bind  = 只做路由亲和
 open  = 路由亲和 + 后端 session KV 隔离
