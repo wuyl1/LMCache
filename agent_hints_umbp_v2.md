@@ -33,7 +33,7 @@ v2 的核心链路是：
 +------------------------------------------------------------+
 | Request Frontend                                           |
 |                                                            |
-| attach hints with request, tokens, and KV layout metadata   |
+| attach hints with request, tokens, and KV layout metadata  |
 +-----------------------------+------------------------------+
                               |
                               v
@@ -116,16 +116,11 @@ Base hints 参考 Dynamo 的 `nvext.agent_hints` 和 `nvext.session_control` 思
 
 ```text
 base:
-  request_id              # 单次请求标识，用于 tracing，不作为 KV identity
   session_id              # 会话标识，用于 sticky routing、session-scoped reuse、生命周期管理
-  tenant_id               # 租户隔离
-  priority                # 请求或缓存保留优先级
-  strict_priority         # 可选，强优先级层级
-  expected_output_tokens  # 类似 Dynamo osl，用于输出 KV block 负载估计
-  expected_next_call_ms   # 类似 iat，用于估计下一轮请求间隔
-  total_expected_calls    # 类似 total_requests，用于估计会话或 agent run 剩余生命周期
   session_action          # open / bind / close
   session_timeout_ms      # session inactivity timeout
+  priority                # 请求或缓存保留优先级
+  expected_output_tokens  # 类似 Dynamo osl，用于输出 KV block 负载估计
 ```
 
 这些字段不要求上层提供完整语义，只要求提供 serving 层容易理解的信息：
@@ -136,6 +131,117 @@ base:
 - `session_action` / `session_timeout_ms` 支持 session open/close、subagent 生命周期和自动清理。
 
 Base 层的生命周期语义应贴近 Dynamo 的 `session_control.timeout`：`session_timeout_ms` 表示 session 多久不活跃后可以关闭，用于 sticky routing、session KV isolation 和清理。它不是某个 semantic span 或 KV block 的缓存 TTL。
+
+不同执行上下文可以使用不同的 `session_id` 和 `session_timeout_ms`。例如用户请求“分析数据库里的销售异常并生成报告”时，主 Agent 与 SQL subagent 的 KV 生命周期不同，不应强行共用同一个 session。
+
+这个例子里报告任务一共有 **2 条 session 生命周期**，即 2 个不同的 `session_id`：`report-main` 和 `report-sql-subagent`。为了说明 `priority`，时间线中还插入一条无关的低优先级后台 session：`background-summary`。这不表示只有 2 次请求；每一轮 LLM 请求都会携带 session hints，区别在于 lifecycle action 只在开关边界出现：
+
+- `session_id`：每一轮都带，用来找到已有 sticky binding 或 session slot。
+- `session_action`：只在生命周期边界带；`bind/open` 表示开始，`close` 表示结束，中间轮次省略表示 continue。
+- `session_timeout_ms`：通常只在 `bind/open` 时设置，用作 inactivity timeout 和漏发 `close` 时的兜底清理，不是 KV block TTL。
+- `priority`：每一轮都可以带，用于 scheduler queue ordering，也可以影响 KV tier placement 和 eviction 优先级；它不是 session 生命周期动作。
+- `expected_output_tokens`：每一轮都可以带，用于 scheduler 估算 decode 阶段的 KV / GPU cache / worker 时间。
+
+这个 base-hints 例子主要覆盖 scheduler 图中的四类决策：
+
+- `decide route`：由 `session_id`、sticky binding 和 worker 负载决定请求去哪个 worker。
+- `session lifecycle`：由 `session_action` 和 `session_timeout_ms` 决定 bind/open/close、inactivity cleanup。
+- `priority queueing`：由 `priority` 决定排队顺序；数值含义由 serving 系统定义，本例假设数值越大优先级越高。
+- `decode load estimate`：由 `expected_output_tokens` 估算未来输出 KV 增长和 worker 负载。
+
+按请求时间线和 session 轮次展开如下：
+
+```text
+req1: 用户请求“分析数据库里的销售异常并生成报告”，主 Agent 理解任务并规划步骤
+  hints:
+    session_id = report-main
+    session_action = bind
+    session_timeout_ms = long
+    priority = 5
+    expected_output_tokens = 256
+  scheduler decisions:
+    - decide route: 根据 KV overlap、当前负载和预计 decode 负载选择 worker-A，并建立 report-main -> worker-A sticky binding
+    - session lifecycle: session_action=bind 只做路由亲和，不创建后端 streaming session slot
+    - session lifecycle: session_timeout_ms=long 表示 report-main 长时间不活跃后才兜底清理
+    - priority queueing: priority=5 表示这是用户可见的交互式报告任务，排队时优先于后台低优先级任务
+    - decode load estimate: expected_output_tokens=256 表示这一轮主要做任务规划，decode 负载较小
+
+req2: 主 Agent 委派 SQL subagent 查询销售表，生成并执行销售异常查询
+  hints:
+    session_id = report-sql-subagent
+    session_action = open
+    session_timeout_ms = short
+    priority = 6
+    expected_output_tokens = 512
+  scheduler decisions:
+    - decide route: 根据 KV overlap、当前负载和预计 decode 负载选择 worker-B，并建立 report-sql-subagent -> worker-B sticky binding
+    - session lifecycle: session_action=open 触发后端 session slot，用于 SQL subagent 的 KV 隔离
+    - session lifecycle: session_timeout_ms=short 表示 SQL session 短时间不活跃即可兜底清理
+    - priority queueing: priority=6 表示 SQL 结果阻塞最终报告，可在队列中略高于主 Agent 的普通整理轮次
+    - decode load estimate: expected_output_tokens=512 帮助 scheduler 估算 SQL 生成和结果解释带来的 decode KV 增长
+    - 此时 report-main 仍然存在；两条 session 生命周期并存
+
+req3: SQL subagent 把异常销售数据和解释返回给主 Agent，结束 SQL 子任务
+  hints:
+    session_id = report-sql-subagent
+    session_action = close
+    session_timeout_ms = omitted
+    priority = 6
+    expected_output_tokens = 128
+  scheduler decisions:
+    - decide route: session_id 指向要关闭的已有 report-sql-subagent session
+    - session lifecycle: session_action=close 解除 sticky binding，关闭后端 session slot
+    - session lifecycle: 释放 SQL subagent 的 session-scoped KV；timeout 不再重要
+    - priority queueing: priority=6 让这个阻塞主报告的收尾请求不要被后台任务拖延
+    - decode load estimate: expected_output_tokens=128 表示这轮只返回整理后的 SQL 结论，预计输出较短
+
+req4: 另一个后台任务请求生成历史销售日志摘要，用于离线归档，不阻塞当前报告
+  hints:
+    session_id = background-summary
+    session_action = bind
+    session_timeout_ms = medium
+    priority = 1
+    expected_output_tokens = 1024
+  scheduler decisions:
+    - decide route: 根据 session_id 建立 background-summary 的 sticky binding
+    - session lifecycle: session_action=bind 只做路由亲和，不创建后端 session slot
+    - priority queueing: priority=1 表示后台低优先级任务；当它与 report-main 或 report-sql-subagent 同时排队时，scheduler 优先处理 priority=5/6 的报告链路
+    - decode load estimate: expected_output_tokens=1024 表示后台摘要可能生成较长输出，scheduler 可以把它的未来 decode 负载计入 worker 选择
+
+req5: 主 Agent 接收 SQL 结果，整理异常原因、影响范围和报告结构
+  hints:
+    session_id = report-main
+    session_action = omitted
+    session_timeout_ms = omitted
+    priority = 5
+    expected_output_tokens = 512
+  scheduler decisions:
+    - decide route: session_id 命中 req1 建立的 report-main binding，继续回到 worker-A
+    - session lifecycle: session_action 省略表示继续已有 main session，不重新 bind/open
+    - session lifecycle: 沿用 long timeout 语义，并刷新 inactivity 计时窗口
+    - priority queueing: priority=5 延续用户可见报告任务的排队优先级
+    - decode load estimate: expected_output_tokens=512 表示这一轮主要整理结构，输出长度中等
+
+req6: 主 Agent 生成最终报告；如果任务不再继续，关闭主 Agent session
+  hints:
+    session_id = report-main
+    session_action = close
+    session_timeout_ms = omitted
+    priority = 5
+    expected_output_tokens = 2048
+  scheduler decisions:
+    - decide route: session_id 指向要关闭的已有 report-main session
+    - session lifecycle: session_action=close 结束 report-main 的 sticky binding
+    - session lifecycle: 如果后端曾为该 session 管理 session-scoped KV，也在这里释放
+    - priority queueing: priority=5 用于最终响应的排队；close 仍由 session_action 控制
+    - decode load estimate: expected_output_tokens=2048 表示最终报告输出较长，scheduler 应把较大的 decode KV / GPU cache 占用纳入负载估计
+
+bind  = 只做路由亲和
+open  = 路由亲和 + 后端 session KV 隔离
+close = 结束已有 session 并释放资源
+```
+
+`session_timeout_ms` 主要作为异常退出、漏发 close 或等待下一轮请求时的兜底清理机制。
 
 Base hints 的价值在于低门槛：即使没有 token span 级语义，scheduler 也能先获得 routing locality、session isolation、priority queueing 和生命周期控制收益。
 
@@ -189,7 +295,7 @@ Scheduler 是 v2 的核心策略层。它不只是排队组件，而是 agent hi
 
 ### 4.1 Routing 与 Session Affinity
 
-Base hints 中的 `session_id` 和 `tenant_id` 用于 routing：
+Base hints 中的 `session_id` 用于 routing：
 
 ```text
 if session_id has sticky worker:
@@ -209,10 +315,10 @@ else:
 
 ### 4.2 Queueing 与 Priority
 
-Base hints 中的 `priority` / `strict_priority` 用于 scheduler 排队：
+Base hints 中的 `priority` 用于 scheduler 排队：
 
 ```text
-queue_order = (strict_priority, policy_score(priority, arrival_time, token_cost))
+queue_order = policy_score(priority, arrival_time, token_cost)
 ```
 
 可能策略：
@@ -246,6 +352,8 @@ Base `session_timeout_ms` 和 advanced `phase_ttl_ms` 是两层不同的生命�
 
 - `session_timeout_ms` 对应 Dynamo `session_control.timeout`，表示 session 多久不活跃后可以关闭。
 - `phase_ttl_ms` 是 semantic span 级缓存 TTL，由 `semantic_spans.phase` 衍生，用来决定某段 KV 多久还值得保留。
+
+因此，`session_timeout_ms` 应按执行上下文设置：主 Agent session 可以较长，短生命周期 subagent session 可以较短，并在 subagent 完成时显式 `close`。`phase_ttl_ms` 则按 `SYSTEM_PROMPT`、`USER_QUERY`、`TOOL_OUTPUT` 等 phase 生成，作用于具体 KV span。
 
 Scheduler 可以把 phase TTL 转成不同所有权模式下的动作：
 
@@ -306,7 +414,6 @@ cache_key = hash(
     tokenizer_id,
     kv_layout_version,
     token_chunk_hash,
-    tenant_id,
     session_id,
     reuse_scope,
     phase,
@@ -318,7 +425,7 @@ cache_key = hash(
 
 - `token_chunk_hash` 证明 token 内容一致。
 - `model_id / tokenizer_id / kv_layout_version` 防止不同模型或 KV layout 误复用。
-- `tenant_id / cache_salt / reuse_scope` 控制安全边界。
+- `session_id / cache_salt / reuse_scope` 控制安全边界。
 - `phase` 可以参与 key 或 metadata，但不能单独证明复用正确性。
 
 如果 key_identity 不完整，scheduler 可以允许 `report` 做 routing hint，但不应允许 `put` 或跨 session/global 复用。
@@ -401,7 +508,6 @@ Agent、Harness 或 Agent Orchestrator 可以产生 base hints；Request Fronten
 {
   "base": {
     "session_id": "report-task-001",
-    "tenant_id": "tenant-a",
     "priority": 5,
     "expected_output_tokens": 1024,
     "session_action": "open",
@@ -504,7 +610,6 @@ Scheduler 再把策略落到 UMBP 的 metadata path、bytes path 和 proposed po
 先支持：
 
 - `session_id`
-- `tenant_id`
 - `priority`
 - `session_timeout_ms`
 - `expected_output_tokens`
