@@ -386,16 +386,19 @@ if session_id has sticky worker:
     route to sticky worker
 else:
     use UMBP external KV match + worker load + prefill/decode cost
+    if match points to remote tier or non-local worker KV:
+        prefetch KV bytes through UMBP data path before dispatch
     bind session_id to selected worker when needed
 ```
 
 对应优化：
 
 - 同一 session 后续请求尽量回到已有 KV 的 worker。
+- 如果 KV lookup 只命中 external metadata，scheduler 可以触发 UMBP prefetch，把远端或冷 tier KV bytes 预取到目标 worker 的本地 KV cache，减少请求到达后的 prefill 等待。
 - subagent 可以拥有独立 `session_id`，结束时通过 `session_action=close` 清理相关 KV。
 - 当 session 过期或关闭时，scheduler 撤销 external KV metadata，释放或降级 session-scoped KV。
 
-这部分接近 Dynamo 的 sticky session 和 KV-aware routing。
+这部分接近 Dynamo 的 sticky session 和 KV-aware routing，但多了一步 UMBP data path prefetch：metadata match 先帮助 scheduler 选 worker，prefetch 再把 KV bytes 提前搬到目标 worker。
 
 ### 4.2 Queueing 与 Priority
 
