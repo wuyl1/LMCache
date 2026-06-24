@@ -144,7 +144,7 @@ Base 层的生命周期语义应贴近 Dynamo 的 `session_control.timeout`：`s
 
 这个 base-hints 例子主要覆盖 scheduler 图中的四类决策：
 
-- `decide route`：由 `session_id`、sticky binding 和 worker 负载决定请求去哪个 worker。
+- `decide route`：由 `session_id`、KV lookup/overlap、sticky binding 和 worker 负载决定请求去哪个 worker；如果只命中 UMBP metadata、目标 worker 没有 KV bytes，scheduler 可以触发 UMBP v2 data path prefetch，例如从 L3 / remote tier 预取 KV 到目标 worker 的 L1 / GPU KV cache。
 - `session lifecycle`：由 `session_action` 和 `session_timeout_ms` 决定 bind/open/close、inactivity cleanup。
 - `priority queueing`：由 `priority` 决定排队顺序；数值含义由 serving 系统定义，本例假设数值越大优先级越高。
 - `decode load estimate`：由 `expected_output_tokens` 估算未来输出 KV 增长和 worker 负载。
@@ -160,7 +160,7 @@ req1: 用户请求“分析数据库里的销售异常并生成报告”，主 A
     priority = 5
     expected_output_tokens = 256
   scheduler decisions:
-    - decide route: 根据 KV overlap、当前负载和预计 decode 负载选择 worker-A，并建立 report-main -> worker-A sticky binding
+    - decide route: 查找系统提示词或报告模板 KV overlap，结合当前负载和预计 decode 负载选择 worker-A，并建立 report-main -> worker-A sticky binding
     - session lifecycle: session_action=bind 只做路由亲和，不创建后端 streaming session slot
     - session lifecycle: session_timeout_ms=long 表示 report-main 长时间不活跃后才兜底清理
     - priority queueing: priority=5 表示这是用户可见的交互式报告任务，排队时优先于后台低优先级任务
@@ -174,7 +174,7 @@ req2: 主 Agent 委派 SQL subagent 查询销售表，生成并执行销售异�
     priority = 6
     expected_output_tokens = 512
   scheduler decisions:
-    - decide route: 根据 KV overlap、当前负载和预计 decode 负载选择 worker-B，并建立 report-sql-subagent -> worker-B sticky binding
+    - decide route: 查找系统提示词、数据库 schema 或工具说明 KV overlap，结合当前负载和预计 decode 负载选择 worker-B，并建立 report-sql-subagent -> worker-B sticky binding
     - session lifecycle: session_action=open 触发后端 session slot，用于 SQL subagent 的 KV 隔离
     - session lifecycle: session_timeout_ms=short 表示 SQL session 短时间不活跃即可兜底清理
     - priority queueing: priority=6 表示 SQL 结果阻塞最终报告，可在队列中略高于主 Agent 的普通整理轮次
@@ -216,7 +216,7 @@ req5: 主 Agent 接收 SQL 结果，整理异常原因、影响范围和报告�
     priority = 5
     expected_output_tokens = 512
   scheduler decisions:
-    - decide route: session_id 命中 req1 建立的 report-main binding，继续回到 worker-A
+    - decide route: session_id 命中 req1 建立的 report-main binding，继续回到 worker-A；若只命中 UMBP metadata 且 worker-A 没有 KV bytes，可触发 UMBP v2 data path prefetch，例如从 L3 / remote tier 预取 KV 到 worker-A 的 L1 / GPU KV cache
     - session lifecycle: session_action 省略表示继续已有 main session，不重新 bind/open
     - session lifecycle: 沿用 long timeout 语义，并刷新 inactivity 计时窗口
     - priority queueing: priority=5 延续用户可见报告任务的排队优先级
