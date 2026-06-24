@@ -25,7 +25,7 @@ v2 的核心链路是：
 +------------------------------------------------------------+
 | Agent / Harness / Agent Orchestrator                       |
 |                                                            |
-| base hints: session_id / session_timeout / priority        |
+| base hints: session_id / action / timeout / priority / OSL |
 | advanced:   semantic spans / reuse_scope / key fields      |
 +-----------------------------+------------------------------+
                               |
@@ -40,8 +40,10 @@ v2 的核心链路是：
 +------------------------------------------------------------+
 | Scheduler                                                  |
 |                                                            |
-| decide route / prefetch / report / put / revoke / tiering  |
-| decide phase TTL / priority / pin / eviction               |
+| base decisions: route / session lifecycle / queue          |
+|                 / load estimate                            |
+| UMBP decisions: prefetch / report / put / revoke / tiering |
+| policy decisions: phase TTL / pin / eviction               |
 +-----------------------------+------------------------------+
                               |
               +---------------+---------------+
