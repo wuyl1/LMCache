@@ -313,6 +313,7 @@ req1: 主 Agent 理解任务并规划步骤
       reuse_scope = SESSION
   scheduler decisions:
     - semantic admission: SYSTEM_PROMPT 是稳定前缀，默认 report；高命中时可 put 到 UMBP 托管
+    - UMBP action: report 时只上报 key/tier/worker metadata；put 时把 KV bytes 交给 UMBP，允许后续跨 worker/tier 复用
     - phase policy: SYSTEM_PROMPT 用 long phase_ttl，USER_QUERY 只给 short phase_ttl
     - safety: 只有 key_identity 完整时才允许 put；否则只允许 metadata-only report
 
@@ -327,6 +328,7 @@ req2: SQL subagent 生成并执行销售异常查询
       reuse_scope = SESSION
   scheduler decisions:
     - semantic admission: 数据库 schema 可 report，用于 SQL subagent 内部后续 KV lookup
+    - UMBP action: 向 UMBP report schema KV metadata，后续 SQL 请求可以通过 metadata 命中回到持有 KV 的 worker
     - phase policy: schema 只在 SQL session 内复用，使用 short phase_ttl
     - safety: reuse_scope=SESSION，避免 SQL 子任务 KV 被主 Agent 或其他任务误复用
 
@@ -342,6 +344,7 @@ req3: SQL subagent 返回异常销售数据并结束 SQL 子任务
       admission = report
   scheduler decisions:
     - semantic admission: SQL 结果只支撑主 Agent 汇总报告，report metadata 即可，不长期 put KV bytes
+    - UMBP action: report SQL result metadata 便于短期 routing；不 put KV bytes，避免临时结果占用 UMBP 存储
     - phase policy: pin 到主 Agent 消费完成；随后随 session close 或 phase TTL 释放
 
 req6: 主 Agent 生成最终报告
@@ -355,6 +358,7 @@ req6: 主 Agent 生成最终报告
       admission = skip
   scheduler decisions:
     - semantic admission: RESPONSE 默认 skip，不 report、不 put，避免一次性输出污染外部 KV
+    - UMBP action: skip 表示 scheduler 不调用 UMBP report/put，这段 generated KV 只由本地引擎按请求生命周期处理
     - phase policy: 如果本地引擎保留 response KV，也给低 priority 或短 phase_ttl
 ```
 
