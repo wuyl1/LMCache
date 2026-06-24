@@ -264,7 +264,6 @@ advanced:
       token_end
       phase              # SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN
       source             # role:system / role:user / tool_event / rule / explicit_hint
-      cacheable          # optional, 上层是否显式认为可缓存
 
   key_identity:
     model_id
@@ -299,12 +298,10 @@ req1: 主 Agent 理解任务并规划步骤
         token_end = 1200
         phase = SYSTEM_PROMPT
         source = role:system
-        cacheable = true
       - token_start = 1200
         token_end = 1260
         phase = USER_QUERY
         source = role:user
-        cacheable = true
     key_identity:
       model_id = llama-...
       tokenizer_id = tok-...
@@ -323,7 +320,6 @@ req2: SQL subagent 生成并执行销售异常查询
         token_end = 1250
         phase = TOOL_OUTPUT
         source = tool_event:schema
-        cacheable = true
     key_identity:
       reuse_scope = SESSION
       cache_salt = report-sql-subagent
@@ -339,7 +335,6 @@ req3: SQL subagent 返回异常销售数据并结束 SQL 子任务
         token_end = 800
         phase = TOOL_OUTPUT
         source = tool_event:sql_result
-        cacheable = false
     policy:
       pin_until_event = agent_step_done
       admission = report
@@ -354,7 +349,6 @@ req6: 主 Agent 生成最终报告
         token_end = 2048
         phase = RESPONSE
         source = role:assistant
-        cacheable = false
     policy:
       admission = skip
   scheduler decisions:
@@ -480,7 +474,7 @@ put:
 
 - `SYSTEM_PROMPT`：默认 report；高命中或全局共享前缀可 put。
 - `USER_QUERY`：session-scoped、短 phase TTL，通常 report，不长期 put。
-- `TOOL_OUTPUT`：根据大小、cacheable hint 和命中统计决定；大且低命中时 skip 或 report。
+- `TOOL_OUTPUT`：根据大小、显式 admission 建议和命中统计决定；大且低命中时 skip 或 report。
 - `PARTIAL_PREFILL`：短 phase TTL，可保护到工具返回。
 - `RESPONSE`：默认 skip，不 report、不 put。
 - `UNKNOWN`：保守处理，skip 或短 phase TTL report。
@@ -619,8 +613,7 @@ Agent、Harness 或 Agent Orchestrator 可以产生 base hints；Request Fronten
         "token_start": 3120,
         "token_end": 23500,
         "phase": "TOOL_OUTPUT",
-        "source": "tool_event",
-        "cacheable": false
+        "source": "tool_event"
       }
     ],
     "key_identity": {
@@ -651,7 +644,7 @@ USER_QUERY:
   - phase_ttl_ms = short
 
 TOOL_OUTPUT:
-  - 如果 cacheable=false 或过大且低命中，admission = skip
+  - 如果 policy.admission=skip，或 span 过大且低命中，admission = skip
   - 如果后续请求或 agent step 会复用，admission = report 或 put
 
 PARTIAL_PREFILL:
@@ -723,7 +716,7 @@ Scheduler 做：
 
 - `SYSTEM_PROMPT` 优先 report/put
 - `RESPONSE` 默认 skip
-- `TOOL_OUTPUT` 根据 cacheable、大小、命中统计做 admission
+- `TOOL_OUTPUT` 根据 admission 建议、大小、命中统计做 admission
 - `PARTIAL_PREFILL` 短 phase TTL；event pin 作为 scheduler 侧保护策略
 
 收益：
