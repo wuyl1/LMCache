@@ -272,7 +272,6 @@ advanced:
     token_chunk_hash
     prefix_hash
     reuse_scope          # GLOBAL / TENANT / AGENT / SESSION / REQUEST
-    cache_salt           # 可选，用于租户或用户隔离
 
   policy:
     phase_priority
@@ -285,7 +284,7 @@ Advanced hints 在 base hints 之上提供四类信息：
 
 - **语义价值识别**：识别 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`RESPONSE` 等不同 KV 的复用价值。
 - **语义生命周期策略**：把 phase 转成 phase TTL、priority、pin 或 demote/evict 策略。
-- **语义安全复用**：把 phase、reuse scope、session_id/cache_salt 与 LMCache-style token chunk key 结合，避免“语义相似”导致错复用。
+- **语义安全复用**：把 phase、reuse_scope、session_id 与 LMCache-style token chunk key 结合，避免“语义相似”导致错复用。
 - **语义准入控制**：决定 chunk 是 `skip`、`report` 还是 `put`。
 
 同样以“分析数据库里的销售异常并生成报告”为例，advanced hints 不是再开新的 session，而是在每轮请求内部告诉 scheduler：哪些 token span 值得复用、能复用到什么范围、应该如何进入 UMBP。下面只列必要字段；后续请求如果模型、tokenizer 和 KV layout 不变，可以省略重复的 `key_identity` 字段。
@@ -307,7 +306,6 @@ req1: 主 Agent 理解任务并规划步骤
       tokenizer_id = tok-...
       kv_layout_version = v1
       reuse_scope = SESSION
-      cache_salt = report-main
   scheduler decisions:
     - semantic admission: SYSTEM_PROMPT 是稳定前缀，默认 report；高命中时可 put 到 UMBP 托管
     - phase policy: SYSTEM_PROMPT 用 long phase_ttl，USER_QUERY 只给 short phase_ttl
@@ -322,11 +320,10 @@ req2: SQL subagent 生成并执行销售异常查询
         source = tool_event:schema
     key_identity:
       reuse_scope = SESSION
-      cache_salt = report-sql-subagent
   scheduler decisions:
     - semantic admission: 数据库 schema 可 report，用于 SQL subagent 内部后续 KV lookup
     - phase policy: schema 只在 SQL session 内复用，使用 short phase_ttl
-    - safety: cache_salt=report-sql-subagent，避免 SQL 子任务 KV 被主 Agent 或其他任务误复用
+    - safety: reuse_scope=SESSION，避免 SQL 子任务 KV 被主 Agent 或其他任务误复用
 
 req3: SQL subagent 返回异常销售数据并结束 SQL 子任务
   advanced hints:
@@ -356,7 +353,7 @@ req6: 主 Agent 生成最终报告
     - phase policy: 如果本地引擎保留 response KV，也给低 priority 或短 phase_ttl
 ```
 
-这个例子的重点是：`semantic_spans` 不直接证明 KV 可复用，它只告诉 scheduler “这段 token 的业务价值是什么”。真正的复用安全仍由 `key_identity` 中的 model、tokenizer、KV layout、token hash、scope 和 salt 保证。
+这个例子的重点是：`semantic_spans` 不直接证明 KV 可复用，它只告诉 scheduler “这段 token 的业务价值是什么”。真正的复用安全仍由 `key_identity` 中的 model、tokenizer、KV layout、token hash、reuse_scope 和 session_id 保证。
 
 `phase_ttl_ms`、`pin_until_event`、`admission` 这些策略可以由上层显式建议，也可以由 scheduler 根据 phase、默认策略、命中率和资源压力衍生。Scheduler 应保留最终裁剪权，例如在 HBM 压力高时把 `TOOL_OUTPUT` 从 `put` 降级为 `report`，或把低价值 `RESPONSE` 直接 `skip`。
 
@@ -491,8 +488,7 @@ cache_key = hash(
     token_chunk_hash,
     session_id,
     reuse_scope,
-    phase,
-    cache_salt
+    phase
 )
 ```
 
@@ -500,7 +496,7 @@ cache_key = hash(
 
 - `token_chunk_hash` 证明 token 内容一致。
 - `model_id / tokenizer_id / kv_layout_version` 防止不同模型或 KV layout 误复用。
-- `session_id / cache_salt / reuse_scope` 控制安全边界。
+- `session_id / reuse_scope` 控制安全边界。
 - `phase` 可以参与 key 或 metadata，但不能单独证明复用正确性。
 
 如果 key_identity 不完整，scheduler 可以允许 `report` 做 routing hint，但不应允许 `put` 或跨 session/global 复用。
