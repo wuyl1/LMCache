@@ -289,16 +289,20 @@ Advanced hints 在 base hints 之上提供四类信息：
 - **语义安全复用**：把 phase、reuse scope、session_id/cache_salt 与 LMCache-style token chunk key 结合，避免“语义相似”导致错复用。
 - **语义准入控制**：决定 chunk 是 `skip`、`report` 还是 `put`。
 
-同样以“分析数据库里的销售异常并生成报告”为例，advanced hints 不是再开新的 session，而是在每轮请求内部告诉 scheduler：哪些 token span 值得复用、能复用到什么范围、应该如何进入 UMBP。下面只列关键轮次；为便于阅读，示例省略具体 `token_start/token_end`。
+同样以“分析数据库里的销售异常并生成报告”为例，advanced hints 不是再开新的 session，而是在每轮请求内部告诉 scheduler：哪些 token span 值得复用、能复用到什么范围、应该如何进入 UMBP。下面只列必要字段；后续请求如果模型、tokenizer 和 KV layout 不变，可以省略重复的 `key_identity` 字段。
 
 ```text
 req1: 主 Agent 理解任务并规划步骤
   advanced hints:
     semantic_spans:
-      - phase = SYSTEM_PROMPT
+      - token_start = 0
+        token_end = 1200
+        phase = SYSTEM_PROMPT
         source = role:system
         cacheable = true
-      - phase = USER_QUERY
+      - token_start = 1200
+        token_end = 1260
+        phase = USER_QUERY
         source = role:user
         cacheable = true
     key_identity:
@@ -308,52 +312,54 @@ req1: 主 Agent 理解任务并规划步骤
       reuse_scope = SESSION
       cache_salt = report-main
   scheduler decisions:
-    - semantic admission: SYSTEM_PROMPT 复用价值高，默认 report；高命中时可 put 到 UMBP 托管
-    - phase policy: SYSTEM_PROMPT 使用 long phase_ttl，USER_QUERY 使用 short phase_ttl
-    - safety: key_identity 完整时才允许 put；否则只允许 metadata-only report
+    - semantic admission: SYSTEM_PROMPT 是稳定前缀，默认 report；高命中时可 put 到 UMBP 托管
+    - phase policy: SYSTEM_PROMPT 用 long phase_ttl，USER_QUERY 只给 short phase_ttl
+    - safety: 只有 key_identity 完整时才允许 put；否则只允许 metadata-only report
 
 req2: SQL subagent 生成并执行销售异常查询
   advanced hints:
     semantic_spans:
-      - phase = SYSTEM_PROMPT
-        source = role:system
-        cacheable = true
-      - phase = TOOL_OUTPUT
+      - token_start = 900
+        token_end = 1250
+        phase = TOOL_OUTPUT
         source = tool_event:schema
         cacheable = true
     key_identity:
       reuse_scope = SESSION
       cache_salt = report-sql-subagent
   scheduler decisions:
-    - semantic admission: 数据库 schema / tool spec 可 report，用于后续 SQL 请求的 KV lookup
-    - phase policy: SQL subagent 的 TOOL_OUTPUT 使用 short phase_ttl，避免临时 schema 或结果长期占用热层
-    - safety: cache_salt 绑定 report-sql-subagent，避免 SQL 子任务 KV 被主 Agent 或其他任务误复用
+    - semantic admission: 数据库 schema 可 report，用于 SQL subagent 内部后续 KV lookup
+    - phase policy: schema 只在 SQL session 内复用，使用 short phase_ttl
+    - safety: cache_salt=report-sql-subagent，避免 SQL 子任务 KV 被主 Agent 或其他任务误复用
 
 req3: SQL subagent 返回异常销售数据并结束 SQL 子任务
   advanced hints:
     semantic_spans:
-      - phase = TOOL_OUTPUT
+      - token_start = 0
+        token_end = 800
+        phase = TOOL_OUTPUT
         source = tool_event:sql_result
         cacheable = false
     policy:
       pin_until_event = agent_step_done
       admission = report
   scheduler decisions:
-    - semantic admission: SQL 结果只需支撑主 Agent 汇总报告，默认 report 而不是 put
-    - phase policy: pin 到主 Agent 消费完成；随后随 session close 或 phase TTL 降级/释放
-    - UMBP action: 上报 metadata 便于短期 routing；不长期保存大块临时结果 KV bytes
+    - semantic admission: SQL 结果只支撑主 Agent 汇总报告，report metadata 即可，不长期 put KV bytes
+    - phase policy: pin 到主 Agent 消费完成；随后随 session close 或 phase TTL 释放
 
 req6: 主 Agent 生成最终报告
   advanced hints:
     semantic_spans:
-      - phase = RESPONSE
+      - token_start = 0
+        token_end = 2048
+        phase = RESPONSE
         source = role:assistant
         cacheable = false
     policy:
       admission = skip
   scheduler decisions:
     - semantic admission: RESPONSE 默认 skip，不 report、不 put，避免一次性输出污染外部 KV
-    - phase policy: 如果本地引擎保留 response KV，也给低 priority 或短 phase_ttl，内存压力下优先释放
+    - phase policy: 如果本地引擎保留 response KV，也给低 priority 或短 phase_ttl
 ```
 
 这个例子的重点是：`semantic_spans` 不直接证明 KV 可复用，它只告诉 scheduler “这段 token 的业务价值是什么”。真正的复用安全仍由 `key_identity` 中的 model、tokenizer、KV layout、token hash、scope 和 salt 保证。
