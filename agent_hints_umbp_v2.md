@@ -289,10 +289,15 @@ Advanced hints 在 base hints 之上提供四类信息：
 
 同样以“分析数据库里的销售异常并生成报告”为例，advanced hints 不是再开新的 session，而是在每轮请求内部告诉 scheduler：哪些 token span 值得复用、能复用到什么范围、应该如何进入 UMBP。下面只列必要字段；后续请求如果模型、tokenizer 和 KV layout 不变，可以省略重复的 `key_identity` 字段。
 
+示例中把 span 分成两类：
+
+- `prompt_spans`：本轮请求输入 prompt 中的 token span，会在 prefill 阶段产生 KV。
+- `generated_spans`：本轮 decode 新生成的 token span，例如最终报告 `RESPONSE`。
+
 ```text
 req1: 主 Agent 理解任务并规划步骤
   advanced hints:
-    semantic_spans:
+    prompt_spans:
       - token_start = 0
         token_end = 1200
         phase = SYSTEM_PROMPT
@@ -313,7 +318,7 @@ req1: 主 Agent 理解任务并规划步骤
 
 req2: SQL subagent 生成并执行销售异常查询
   advanced hints:
-    semantic_spans:
+    prompt_spans:
       - token_start = 900
         token_end = 1250
         phase = TOOL_OUTPUT
@@ -327,7 +332,7 @@ req2: SQL subagent 生成并执行销售异常查询
 
 req3: SQL subagent 返回异常销售数据并结束 SQL 子任务
   advanced hints:
-    semantic_spans:
+    prompt_spans:
       - token_start = 0
         token_end = 800
         phase = TOOL_OUTPUT
@@ -341,7 +346,7 @@ req3: SQL subagent 返回异常销售数据并结束 SQL 子任务
 
 req6: 主 Agent 生成最终报告
   advanced hints:
-    semantic_spans:
+    generated_spans:
       - token_start = 0
         token_end = 2048
         phase = RESPONSE
@@ -352,6 +357,8 @@ req6: 主 Agent 生成最终报告
     - semantic admission: RESPONSE 默认 skip，不 report、不 put，避免一次性输出污染外部 KV
     - phase policy: 如果本地引擎保留 response KV，也给低 priority 或短 phase_ttl
 ```
+
+其中 `TOOL_OUTPUT` 虽然来自工具输出，但在下一轮 LLM 请求里通常已经被拼进 prompt，因此属于 `prompt_spans`。`RESPONSE` 在这里指 req6 当前 decode 产生的最终报告输出，不是前几轮历史响应拼接成的 prompt。
 
 这个例子的重点是：`semantic_spans` 不直接证明 KV 可复用，它只告诉 scheduler “这段 token 的业务价值是什么”。真正的复用安全仍由 `key_identity` 中的 model、tokenizer、KV layout、token hash、reuse_scope 和 session_id 保证。
 
