@@ -132,6 +132,8 @@ base:
 - `expected_output_tokens` 告诉 scheduler 这条请求未来 decode 阶段大概会占多少 KV / GPU cache / worker 时间，用于估算输出 KV 增长和 worker 未来负载。
 - `session_action` / `session_timeout_ms` 支持 session open/close、subagent 生命周期和自动清理。
 
+这里暂不单设 `latency_sensitive` 字段。低延迟或用户可见的请求先通过更高的 `priority` 表达；如果后续需要硬 SLO，可以再扩展 `deadline_ms` 或 `latency_slo_ms` 这类更明确的字段。
+
 `expected_output_tokens` 可以由上层近似估算，不要求精确：
 
 - 如果只有 `max_tokens`，可以把它作为保守上界。
@@ -407,7 +409,7 @@ queue_order = policy_score(priority, arrival_time, token_cost)
 
 - 高优先级请求先调度。
 - 长 prefill、低优先级请求可延后或降级。
-- 对 latency-sensitive 请求提高 routing 和 cache retrieval 优先级。
+- 对高 `priority` 的用户可见请求提高 routing 和 cache retrieval 优先级。
 
 `priority` 也可以作为 UMBP policy hint，用来影响 tier placement 和 eviction 顺序：
 
