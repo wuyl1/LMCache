@@ -285,7 +285,7 @@ Advanced hints 在 base hints 之上提供四类信息：
 
 - **语义价值识别**：识别 `SYSTEM_PROMPT`、`TOOL_OUTPUT`、`RESPONSE` 等不同 KV 的复用价值。
 - **语义生命周期策略**：把 phase 转成 phase TTL、priority 或 demote/evict 策略。
-- **语义安全复用**：把 phase、reuse_scope、session_id 与 LMCache-style token chunk key 结合，避免“语义相似”导致错复用。
+- **语义安全复用**：用 `reuse_scope`、`session_id` 和 LMCache-style token chunk key 控制复用边界，避免“语义相似”导致错复用；`phase` 只影响策略，不证明复用正确性。
 - **语义准入控制**：决定 chunk 是 `skip`、`report` 还是 `put`。
 
 同样以“分析数据库里的销售异常并生成报告”为例，advanced hints 不是再开新的 session，而是在每轮请求内部告诉 scheduler：哪些 token span 值得复用、能复用到什么范围、应该如何进入 UMBP。下面只列必要字段；后续请求如果模型、tokenizer 和 KV layout 不变，可以省略重复的 `key_identity` 字段。
@@ -497,8 +497,7 @@ cache_key = hash(
     kv_layout_version,
     token_chunk_hash,
     session_id,
-    reuse_scope,
-    phase
+    reuse_scope
 )
 ```
 
@@ -507,7 +506,7 @@ cache_key = hash(
 - `token_chunk_hash` 证明 token 内容一致。
 - `model_id / tokenizer_id / kv_layout_version` 防止不同模型或 KV layout 误复用。
 - `session_id / reuse_scope` 控制安全边界。
-- `phase` 可以参与 key 或 metadata，但不能单独证明复用正确性。
+- `phase` 用作 v2 metadata / policy input，用来决定 TTL、priority、admission 和 eviction。
 
 如果 key_identity 不完整，scheduler 可以允许 `report` 做 routing hint，但不应允许 `put` 或跨 session/global 复用。
 
