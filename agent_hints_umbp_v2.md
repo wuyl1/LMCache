@@ -264,7 +264,7 @@ advanced:
   semantic_spans:
     - token_start
       token_end
-      phase              # SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / PARTIAL_PREFILL / RESPONSE / UNKNOWN
+      phase              # SYSTEM_PROMPT / USER_QUERY / TOOL_OUTPUT / RESPONSE / UNKNOWN
       source             # role:system / role:user / tool_event / rule / explicit_hint
 
   key_identity:
@@ -395,8 +395,8 @@ else:
 
 - 同一 session 后续请求尽量回到已有 KV 的 worker。
 - 如果 KV lookup 只命中 external metadata，scheduler 可以触发 UMBP prefetch，把远端或冷 tier KV bytes 预取到目标 worker 的本地 KV cache，减少请求到达后的 prefill 等待。
-- subagent 可以拥有独立 `session_id`，结束时通过 `session_action=close` 清理相关 KV。
-- 当 session 过期或关闭时，scheduler 撤销 external KV metadata，释放或降级 session-scoped KV。
+- 多轮 subagent 可以用独立 `session_id` 和 `session_action=open/close` 管理后端 session KV；如果只需要 sticky routing，用 `bind` 即可。
+- 当 session 过期或关闭时，UMBP 只执行 scheduler 按 key/block metadata 下发的 revoke/demote/evict；后端 streaming session slot 的释放属于推理引擎/worker 的职责。
 
 这部分接近 Dynamo 的 sticky session 和 KV-aware routing，但多了一步 UMBP data path prefetch：metadata match 先帮助 scheduler 选 worker，prefetch 再把 KV bytes 提前搬到目标 worker。
 
@@ -459,9 +459,6 @@ USER_QUERY:
   phase_ttl_ms = short
   reuse_scope = SESSION
 
-PARTIAL_PREFILL:
-  phase_ttl_ms = very_short
-
 RESPONSE:
   admission = skip
 ```
@@ -486,7 +483,6 @@ put:
 - `SYSTEM_PROMPT`：默认 report；高命中或全局共享前缀可 put。
 - `USER_QUERY`：session-scoped、短 phase TTL，通常 report，不长期 put。
 - `TOOL_OUTPUT`：根据大小、显式 admission 建议和命中统计决定；大且低命中时 skip 或 report。
-- `PARTIAL_PREFILL`：短 phase TTL，可保护到工具返回。
 - `RESPONSE`：默认 skip，不 report、不 put。
 - `UNKNOWN`：保守处理，skip 或短 phase TTL report。
 
@@ -569,7 +565,7 @@ evict(key_or_block, reason)
   release KV that scheduler has classified as low-value or expired
 ```
 
-Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `PARTIAL_PREFILL` 可以保护到 tool result 返回，`SYSTEM_PROMPT` 可以长期保留在热层，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、phase TTL 和 priority，不需要理解这些 phase 的业务语义。
+Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `SYSTEM_PROMPT` 可以长期保留在热层，`TOOL_OUTPUT` 使用短 TTL 或按需 report，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、phase TTL 和 priority，不需要理解这些 phase 的业务语义。
 
 ---
 
@@ -581,7 +577,6 @@ Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作�
 SYSTEM_PROMPT:  公司统一分析规范，约 3K tokens
 USER_QUERY:     “分析华东区 Q2 销售异常”
 TOOL_OUTPUT:    SQL 查询结果，约 20K tokens
-PARTIAL_PREFILL: 等待 SQL 时已 prefill 的工具无关上下文
 RESPONSE:       最终中文报告
 ```
 
@@ -657,9 +652,6 @@ TOOL_OUTPUT:
   - 如果 policy.admission=skip，或 span 过大且低命中，admission = skip
   - 如果后续请求或 agent step 会复用，admission = report 或 put
 
-PARTIAL_PREFILL:
-  - phase_ttl_ms = very short
-
 RESPONSE:
   - admission = skip
 ```
@@ -726,7 +718,7 @@ Scheduler 做：
 - `SYSTEM_PROMPT` 优先 report/put
 - `RESPONSE` 默认 skip
 - `TOOL_OUTPUT` 根据 admission 建议、大小、命中统计做 admission
-- `PARTIAL_PREFILL` 使用短 phase TTL；必要时提高 priority 保护当前 step 的短期复用
+- 临时上下文不单独引入 phase；默认归入 `USER_QUERY` 或 `TOOL_OUTPUT`，用短 phase TTL 控制
 
 收益：
 
