@@ -585,8 +585,6 @@ Scheduler decision
         └── owned-by-UMBP bytes path:
               ├── put    -> UMBP batch_put_from_ptr()
               ├── get    -> UMBP batch_get_into_ptr()
-              ├── policy -> priority / depth / phase TTL / tier hints
-              │
               └── proposed policy controls:
                     ├── update -> adjust priority or phase TTL
                     ├── demote -> move key/block from hot tier to colder tier
@@ -598,6 +596,7 @@ Scheduler decision
 - 推理 worker 负责模型执行、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
 - UMBP metadata path 只维护 externally-owned KV 的 hash、tier、node 信息，用于 `match_external_kv()` 这类 advisory routing；这些 external KV blocks 不能通过 UMBP 的 owned-key data path 直接读取 bytes。
 - UMBP-owned bytes path 使用 `batch_put_from_ptr()` / `batch_get_into_ptr()` 托管和取回 KV bytes；peer 持有真实 slot、page location、tier storage 和 eviction 状态。
+- priority、phase TTL、tier placement 这类 agent-hint policy 不是当前稳定基础数据面；在 v2 中作为 scheduler 下发给 UMBP 的 proposed policy controls。
 - UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
 
 在这个基础上，`update priority`、`update phase TTL`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口。它们不是当前源码已经稳定暴露的基础数据面接口，而是把 scheduler 从“只给 priority / phase TTL 建议”推进到“可以显式调整、降级和释放特定 KV”的闭环控制。
