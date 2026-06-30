@@ -76,10 +76,6 @@ v2 的核心链路是：
               | fetched KV bytes copied into worker   |
               | buffer; match result guides routing   |
               |<--------------------------------------+
-              |                                       |
-              | produced KV metadata / key ownership  |
-              | updates                               |
-              +-------------------------------------->|
                                                       |
 Scheduler -> UMBP proposed policy API:
   update priority / update phase TTL / demote / evict
