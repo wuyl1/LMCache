@@ -569,6 +569,26 @@ v2 中 scheduler 同时驱动推理 worker 和 UMBP，而不是通过 adapter �
 
 ```text
 Scheduler decision
+  ├── inputs:
+  │     ├── base hints:
+  │     │     session_id / session_action / timeout
+  │     │     priority / expected_output_tokens
+  │     └── advanced hints:
+  │           semantic spans / key_identity / policy
+  │
+  ├── base_hint_decision:
+  │     ├── session routing / sticky binding
+  │     ├── optional UMBP match / prefetch for KV locality
+  │     ├── session open / close / timeout cleanup
+  │     ├── optional UMBP metadata revoke on close / timeout
+  │     ├── priority queueing
+  │     └── decode load estimate
+  │
+  ├── advanced_hint_decision:
+  │     ├── semantic admission: skip / report / put
+  │     ├── canonical key generation
+  │     └── phase TTL / priority / eviction policy
+  │
   ├── worker_action:
   │     ├── route request to selected worker
   │     ├── prefill / decode
@@ -590,6 +610,20 @@ Scheduler decision
                     ├── demote -> move key/block from hot tier to colder tier
                     └── evict  -> release low-value key/block explicitly
 ```
+
+这里的 `base_hint_decision` 和 `advanced_hint_decision` 是 scheduler 的策略计算阶段：
+
+- `base_hint_decision` 产出请求级调度计划：选哪个 worker、是否建立或解除 sticky binding、是否打开或关闭后端 session、请求在队列中的顺序，以及预计 decode 负载。
+- `advanced_hint_decision` 产出缓存策略计划：哪些 KV 只做 metadata report、哪些 KV 可以 put 给 UMBP 托管、哪些 KV skip，以及对应的 key、TTL、priority 和 eviction 建议。
+
+UMBP 不直接解释 `session_action`、`priority` 或 `expected_output_tokens`。
+在 `base_hint_decision` 中，UMBP 主要作为 scheduler 的辅助数据面：
+
+- routing 时用 `match_external_kv()` 提供 KV locality 候选。
+- 选定 worker 后，按需 prefetch KV bytes。
+- session close/timeout 后，按 scheduler 记录的 key/block metadata revoke 相关 external KV metadata。
+
+这些 decision 本身不直接搬 KV。Scheduler 会把结果继续翻译成下面的 `worker_action` 和 `umbp_action`。
 
 这里要保持三条边界清晰：
 
