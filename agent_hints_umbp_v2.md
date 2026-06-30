@@ -41,10 +41,10 @@ v2 的核心链路是：
 +------------------------------------------------------------+
 | Scheduler                                                  |
 |                                                            |
-| base decisions: route / session lifecycle / queue          |
-|                 / load estimate                            |
-| UMBP actions:  match / prefetch / report / put / revoke    |
-| scheduler policy: priority / phase TTL / eviction / tier   |
+| decisions: route / session lifecycle / queue               |
+|            / load estimate / admission / policy            |
+| UMBP calls: match / prefetch / report / put / revoke       |
+| proposed controls: update priority / TTL / demote / evict  |
 +-----------------------------+------------------------------+
                               |
               +---------------+---------------+
