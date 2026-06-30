@@ -43,8 +43,8 @@ v2 的核心链路是：
 |                                                            |
 | base decisions: route / session lifecycle / queue          |
 |                 / load estimate                            |
-| UMBP decisions: prefetch / report / put / revoke / tiering |
-| policy decisions: priority / phase TTL / eviction          |
+| UMBP actions:  match / prefetch / report / put / revoke    |
+| scheduler policy: priority / phase TTL / eviction / tier   |
 +-----------------------------+------------------------------+
                               |
               +---------------+---------------+
@@ -62,8 +62,7 @@ v2 的核心链路是：
 |                            |       | Proposed agent-hint controls:      |
 |                            |       | - update priority / phase_ttl      |
 |                            |       | - demote / promote across tiers    |
-|                            |       | - evict / expire / update phase_ttl|
-|                            |       | - priority and admission policy    |
+|                            |       | - evict / expire by key or block   |
 +-------------+--------------+       +-----------------+------------------+
               |                                       ^
               | metadata report: external KV hash,    |
@@ -78,11 +77,11 @@ v2 的核心链路是：
               | buffer; match result guides routing   |
               |<--------------------------------------+
               |                                       |
-              | local cache pressure / produced KV    |
-              | and block lifecycle events            |
+              | produced KV metadata / key ownership  |
+              | updates                               |
               +-------------------------------------->|
                                                       |
-Scheduler -> UMBP policy API:
+Scheduler -> UMBP proposed policy API:
   update priority / update phase TTL / demote / evict
 
 UMBP -> Scheduler feedback:
