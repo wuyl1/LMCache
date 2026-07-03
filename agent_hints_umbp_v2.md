@@ -420,6 +420,26 @@ req6: 主 Agent 生成最终报告
 
 Advanced hints 不要求一次性全部具备。没有显式 semantic spans 时，scheduler 可以根据 message role、tool event 和默认规则生成保守 phase；没有完整 key_identity 时，只允许 metadata-only routing，不进入 UMBP-owned KV bytes 托管。
 
+### 3.3 Hint 到执行动作的映射
+
+下表总结每类 hint 进入 serving 层后分别影响哪些组件。Scheduler 负责解释 hint 并做策略决策；worker 和 UMBP 只执行 scheduler 下发的动作。
+
+| Hint | Scheduler 动作 | Worker 动作 | UMBP 动作 |
+| --- | --- | --- | --- |
+| `session_id` | 做 sticky routing、session lookup、KV locality 判断 | 回到被选中的 worker 继续 prefill/decode | 可选：`match_external_kv()` 提供 KV locality 候选 |
+| `session_action=bind` | 建立 router-side sticky binding | 不创建后端 session slot | 通常无动作；如有 session-scoped metadata，可按需记录关联 |
+| `session_action=open` | 建立 sticky binding，并触发后端 session 生命周期 | 创建后端 session KV 隔离资源，例如 SGLang streaming session | 通常无动作；UMBP 不负责后端 session slot |
+| `session_action=close` | 解除 sticky binding，停止刷新 session timeout | 若曾 `open`，释放后端 session KV 资源 | 可选：按 scheduler 记录 revoke external metadata；对 UMBP-owned KV 可按策略 demote/evict |
+| `session_timeout_ms` | 设置 inactivity cleanup 兜底时间 | 超时后由后端释放对应 session 资源 | 可选：超时后 revoke session-scoped external metadata |
+| `priority` | 决定 queue ordering，并作为 cache policy 输入 | 可影响后端请求调度或本地 eviction priority | 可选：影响 UMBP-owned tier 保留优先级或 external metadata 保留 |
+| `expected_output_tokens` / `OSL` | 估算 decode load 和未来 KV 增长 | 不直接执行；实际生成长度由引擎产生 | 通常无直接动作；只间接影响 scheduler 是否 prefetch/put |
+| `semantic_spans.phase` | 判断 KV 语义价值，衍生 TTL、priority、admission | 产生或保留对应 prompt/generated KV | 不理解 phase；只接收 scheduler 转换后的 key/block policy |
+| `semantic_spans.source` | 辅助区分 role、tool event、显式 hint 来源 | 无直接动作 | 无直接动作 |
+| `key_identity` | 生成 canonical key，决定是否允许安全复用和 `put` | 暴露 KV layout / pointer，供安全 put/get 使用 | `report` 时记录 metadata；`put/get` 时按 canonical key 托管或取回 KV bytes |
+| `policy.phase_ttl_ms` | 决定 KV metadata 或 UMBP-owned KV 的生命周期 | 本地 KV 仍按 worker/engine 生命周期管理 | 可选：TTL 到期后 revoke metadata，或对 UMBP-owned KV demote/evict |
+| `policy.phase_priority` | 调整缓存保留顺序和资源压力下的裁剪策略 | 可影响本地保留优先级，取决于后端支持 | 可选：作为 proposed control 更新 UMBP-owned KV priority |
+| `policy.admission` | 决定 `skip`、`report` 或 `put` | `skip` 时只由本地引擎处理；`put` 时提供 KV pointer/layout | `report` 只登记 metadata；`put` 托管 KV bytes；`skip` 不调用 UMBP |
+
 ---
 
 ## 4. Scheduler 如何消费 Hints
