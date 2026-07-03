@@ -74,14 +74,14 @@ v2 的核心链路是：
               +-------------------------------------->|
               |                                       |
               | fetched KV bytes copied into worker   |
-              | buffer; match result guides routing   |
+              | buffer                                |
               |<--------------------------------------+
                                                       |
 Scheduler -> UMBP proposed policy API:
   update priority / update phase TTL / demote / evict
 
 UMBP -> Scheduler feedback:
-  policy result / matched candidates / tier state / pressure signal
+  matched candidates / tier state / policy result / pressure signal
 ```
 
 这个架构中，scheduler 是策略中枢，worker 和 UMBP 是并行执行子系统：
@@ -124,7 +124,7 @@ base:
 这些字段不要求上层提供完整语义，只要求提供 serving 层容易理解的信息：
 
 - `session_id` 让 scheduler 做 sticky session routing，减少同一会话 KV 在 worker 间漂移。
-- `priority` 影响 scheduler queue ordering、UMBP eviction/tier 策略。
+- `priority` 影响 scheduler queue ordering，也可作为 UMBP-owned tier / external metadata 策略的输入。
 - `expected_output_tokens` 告诉 scheduler 这条请求未来 decode 阶段大概会占多少 KV / GPU cache / worker 时间，用于估算输出 KV 增长和 worker 未来负载。
 - `session_action` / `session_timeout_ms` 支持 session open/close、subagent 生命周期和自动清理。
 
@@ -146,12 +146,12 @@ Base 层的生命周期语义应贴近 Dynamo 的 `session_control.timeout`：`s
 - `session_id`：每一轮都带，用来找到已有 sticky binding 或 session slot。
 - `session_action`：只在生命周期边界带；`bind/open` 表示开始，`close` 表示结束，中间轮次省略表示 continue。
 - `session_timeout_ms`：通常只在 `bind/open` 时设置，用作 inactivity timeout 和漏发 `close` 时的兜底清理，不是 KV block TTL。
-- `priority`：每一轮都可以带，用于 scheduler queue ordering，也可以影响 KV tier placement 和 eviction 优先级；它不是 session 生命周期动作。
+- `priority`：每一轮都可以带，用于 scheduler queue ordering，也可以影响 UMBP-owned tier placement、external metadata 保留和 eviction 优先级；它不是 session 生命周期动作。
 - `expected_output_tokens`：每一轮都可以带，用于 scheduler 估算 decode 阶段的 KV / GPU cache / worker 时间。
 
 这个 base-hints 例子主要覆盖 scheduler 图中的四类决策：
 
-- `decide route`：由 `session_id`、KV lookup/overlap、sticky binding 和 worker 负载决定请求去哪个 worker；如果只命中 UMBP metadata、目标 worker 没有 KV bytes，scheduler 可以触发 UMBP v2 data path prefetch，例如从 L3 / remote tier 预取 KV 到目标 worker 的 L1 / GPU KV cache。
+- `decide route`：由 `session_id`、KV lookup/overlap、sticky binding 和 worker 负载决定请求去哪个 worker；如果只命中 UMBP metadata、目标 worker 没有 KV bytes，scheduler 可以触发 UMBP v2 data path prefetch，例如从 UMBP-owned DRAM/SSD 或 remote peer 取回 KV bytes，写入目标 worker 提供的 buffer，再由推理引擎消费。
 - `session lifecycle`：由 `session_action` 和 `session_timeout_ms` 决定 bind/open/close、inactivity cleanup。
 - `priority queueing`：由 `priority` 决定排队顺序；数值含义由 serving 系统定义，本例假设数值越大优先级越高。
 - `decode load estimate`：由 `expected_output_tokens` 估算未来输出 KV 增长和 worker 负载。
@@ -259,8 +259,8 @@ req5: 主 Agent 接收 SQL 结果
     - decide route:
         session_id 命中 req1 建立的 report-main binding，继续回到 worker-A；
         若只命中 UMBP metadata 且 worker-A 没有 KV bytes，可触发
-        UMBP v2 data path prefetch，例如从 L3 / remote tier 预取 KV 到
-        worker-A 的 L1 / GPU KV cache
+        UMBP v2 data path prefetch，例如从 UMBP-owned DRAM/SSD 或 remote peer
+        取回 KV bytes，写入 worker-A 提供的 buffer
     - session lifecycle:
         session_action 省略表示继续已有 main session，不重新 bind/open；
         沿用 long timeout 语义，并刷新 inactivity 计时窗口
@@ -295,6 +295,8 @@ bind  = 只做路由亲和
 open  = 路由亲和 + 后端 session KV 隔离
 close = 结束已有 session 并释放资源
 ```
+
+对更复杂的 swarm-style agent workflow，主 Agent 可以并行启动多个 subagent，每个 subagent 使用独立 `session_id` 和短生命周期 `open/close`。Scheduler 通过 `priority` 和 `expected_output_tokens` 在多条 session 之间做排队和负载估计。
 
 `session_timeout_ms` 主要作为异常退出、漏发 close 或等待下一轮请求时的兜底清理机制。
 
@@ -414,7 +416,7 @@ req6: 主 Agent 生成最终报告
 
 这个例子的重点是：`semantic_spans` 不直接证明 KV 可复用，它只告诉 scheduler “这段 token 的业务价值是什么”。真正的复用安全仍由 `key_identity` 中的 model、tokenizer、KV layout、token hash、reuse_scope 和 session_id 保证。
 
-`phase_ttl_ms`、`admission` 这些策略可以由上层显式建议，也可以由 scheduler 根据 phase、默认策略、命中率和资源压力衍生。Scheduler 应保留最终裁剪权，例如在 HBM 压力高时把 `TOOL_OUTPUT` 从 `put` 降级为 `report`，或把低价值 `RESPONSE` 直接 `skip`。
+`phase_ttl_ms`、`admission` 这些策略可以由上层显式建议，也可以由 scheduler 根据 phase、默认策略、命中率和资源压力衍生。Scheduler 应保留最终裁剪权，例如在 worker 或 UMBP-owned tier 压力高时把 `TOOL_OUTPUT` 从 `put` 降级为 `report`，或把低价值 `RESPONSE` 直接 `skip`。
 
 Advanced hints 不要求一次性全部具备。没有显式 semantic spans 时，scheduler 可以根据 message role、tool event 和默认规则生成保守 phase；没有完整 key_identity 时，只允许 metadata-only routing，不进入 UMBP-owned KV bytes 托管。
 
@@ -441,7 +443,7 @@ else:
 对应优化：
 
 - 同一 session 后续请求尽量回到已有 KV 的 worker。
-- 如果 KV lookup 只命中 external metadata，scheduler 可以触发 UMBP prefetch，把远端或冷 tier KV bytes 预取到目标 worker 的本地 KV cache，减少请求到达后的 prefill 等待。
+- 如果 KV lookup 只命中 external metadata，scheduler 可以触发 UMBP prefetch，把远端或冷 tier KV bytes 取回到目标 worker buffer；是否进入推理引擎本地 KV cache 仍由 worker/engine 决定。
 - 多轮 subagent 可以用独立 `session_id` 和 `session_action=open/close` 管理后端 session KV；如果只需要 sticky routing，用 `bind` 即可。
 - 当 session 过期或关闭时，UMBP 只执行 scheduler 按 key/block metadata 下发的 revoke/demote/evict；后端 streaming session slot 的释放属于推理引擎/worker 的职责。
 
@@ -461,10 +463,10 @@ queue_order = policy_score(priority, arrival_time, token_cost)
 - 长 prefill、低优先级请求可延后或降级。
 - 对高 `priority` 的用户可见请求提高 routing 和 cache retrieval 优先级。
 
-`priority` 也可以作为 UMBP policy hint，用来影响 tier placement 和 eviction 顺序：
+`priority` 也可以作为 scheduler policy hint，用来影响 UMBP-owned tier placement、external metadata 保留和 eviction 顺序：
 
-- 高 priority KV 优先保留在 HBM/DRAM。
-- 低 priority KV 更早下沉到 SSD 或被撤销 metadata。
+- 高 priority KV 更倾向于被 `report` 或 `put`，并在 UMBP-owned DRAM/SSD tier 中获得更高保留优先级。
+- 低 priority KV 更早被降级、evict，或撤销 external metadata。
 
 ### 4.3 Output Load Estimation
 
@@ -478,7 +480,7 @@ estimated_output_blocks = ceil(expected_output_tokens / block_size)
 
 - 避免把大量长输出请求集中到同一个 worker。
 - 在 routing 时同时考虑 prefill KV overlap 和 decode 未来负载。
-- 在 UMBP tier 策略中预留或限制热层空间。
+- 在 UMBP-owned DRAM/SSD tier 策略中预留或限制空间。
 
 ### 4.4 Lifecycle 与 Phase TTL
 
@@ -625,6 +627,7 @@ UMBP 不直接解释 `session_action`、`priority` 或 `expected_output_tokens`�
 - 推理 worker 负责模型执行、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
 - UMBP metadata path 只维护 externally-owned KV 的 hash、tier、node 信息，用于 `match_external_kv()` 这类 advisory routing；这些 external KV blocks 不能通过 UMBP 的 owned-key data path 直接读取 bytes。
 - UMBP-owned bytes path 使用 `batch_put_from_ptr()` / `batch_get_into_ptr()` 托管和取回 KV bytes；peer 持有真实 slot、page location、tier storage 和 eviction 状态。
+- UMBP 可以记录 HBM/DRAM/SSD 等 external tier metadata，也可以托管 peer-owned DRAM/SSD KV bytes；但推理引擎本地 KV cache 的物理生命周期仍由 worker/engine 管理。
 - priority、phase TTL、tier placement 这类 agent-hint policy 不是当前稳定基础数据面；在 v2 中作为 scheduler 下发给 UMBP 的 proposed policy controls。
 - UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
 
@@ -637,13 +640,13 @@ update_policy(key_or_block, priority, phase_ttl)
   adjust retention priority and semantic lifetime
 
 demote(key_or_block, target_tier)
-  move reusable but cold KV from HBM/DRAM to SSD or remote tier
+  move reusable but cold UMBP-owned KV from DRAM to SSD or remote peer tier
 
 evict(key_or_block, reason)
   release KV that scheduler has classified as low-value or expired
 ```
 
-Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `SYSTEM_PROMPT` 可以长期保留在热层，`TOOL_OUTPUT` 使用短 TTL 或按需 report，低价值 `RESPONSE` 可以在内存压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、phase TTL 和 priority，不需要理解这些 phase 的业务语义。
+Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `SYSTEM_PROMPT` 可以长期保留在 UMBP-owned 热层或持续 report external metadata，`TOOL_OUTPUT` 使用短 TTL 或按需 report，低价值 `RESPONSE` 可以在资源压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、phase TTL 和 priority，不需要理解这些 phase 的业务语义。
 
 ---
 
@@ -816,7 +819,7 @@ Scheduler 做：
 Scheduler 做：
 
 - 只把高价值 KV 交给 UMBP 托管。
-- 根据 priority / phase TTL / phase 影响 HBM/DRAM/SSD 分层和 eviction 顺序。
+- 根据 priority / phase TTL / phase 影响 UMBP-owned DRAM/SSD 分层、external metadata 保留和 eviction 顺序。
 - 在 phase TTL 到期或资源压力升高时调用 policy controls，允许 UMBP 降级、回收或撤销 metadata。
 
 收益：
