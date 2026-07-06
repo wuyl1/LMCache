@@ -440,6 +440,14 @@ Advanced hints 不要求一次性全部具备。没有显式 semantic spans 时�
 | `policy.phase_priority` | 调整缓存保留顺序和资源压力下的裁剪策略 | 可影响本地保留优先级，取决于后端支持 | 可选：作为 proposed control 更新 UMBP-owned KV priority |
 | `policy.admission` | 决定 `skip`、`report` 或 `put` | `skip` 时只由本地引擎处理；`put` 时提供 KV pointer/layout | `report` 只登记 metadata；`put` 托管 KV bytes；`skip` 不调用 UMBP |
 
+`pin` 曾作为候选机制，其核心语义是临时保护即将复用的 prefix 或 KV block，使其在保护期内不被普通 eviction 淘汰。
+
+这里的 `pin_until_event` 更接近 event-triggered protection，而不是简单 TTL。典型流程是：orchestrator 先提交一段可提前计算的 partial prefill，由 engine 产生对应 KV；这些 KV 会被 pin 住，直到后续事件发生，例如 tool output 到达并接上，或 tool 失败 / 超时导致 partial prefill 被丢弃。事件完成后，pin 释放，KV 重新回到普通 TTL、priority 或 LRU 管理。
+
+实现上，pin 通常不是复制 KV，也不是改变 key，而是在 cache metadata 上增加“不可被普通淘汰”的状态，例如 pin flag、引用计数、最高复用优先级或 release condition。它必须配套资源上限和释放路径，否则容易把缓存锁死。
+
+因此 v2 先用 `phase_ttl_ms`、`priority`、`admission` 和 `session_action=close` 表达生命周期与保留优先级；未来如需支持 pin，应作为独立的 key/block-level control 设计。
+
 ---
 
 ## 4. Scheduler 如何消费 Hints
@@ -580,206 +588,7 @@ cache_key = hash(
 
 ---
 
-## 5. Scheduler 调度 UMBP 与推理 Worker
-
-v2 中 scheduler 同时驱动推理 worker 和 UMBP，而不是通过 adapter 间接控制 UMBP：
-
-```text
-Scheduler decision
-  ├── inputs:
-  │     ├── base hints:
-  │     │     session_id / session_action / timeout
-  │     │     priority / expected_output_tokens
-  │     └── advanced hints:
-  │           semantic spans / key_identity / policy
-  │
-  ├── base_hint_decision:
-  │     ├── session routing / sticky binding
-  │     ├── optional UMBP match / prefetch for KV locality
-  │     ├── session open / close / timeout cleanup
-  │     ├── optional UMBP metadata revoke on close / timeout
-  │     ├── priority queueing
-  │     └── decode load estimate
-  │
-  ├── advanced_hint_decision:
-  │     ├── semantic admission: skip / report / put
-  │     ├── canonical key generation
-  │     └── phase TTL / priority / eviction policy
-  │
-  ├── worker_action:
-  │     ├── route request to selected worker
-  │     ├── prefill / decode
-  │     ├── expose KV layout / ptr for UMBP-owned chunks
-  │     ├── report locally-owned KV hashes when using metadata-only mode
-  │     └── consume KV fetched from UMBP
-  │
-  └── umbp_action:
-        ├── metadata path:
-        │     ├── match  -> UMBP match_external_kv()
-        │     ├── report -> UMBP report_external_kv_blocks()
-        │     └── revoke -> UMBP revoke_external_kv_blocks()
-        │
-        └── owned-by-UMBP bytes path:
-              ├── put    -> UMBP batch_put_from_ptr()
-              ├── get    -> UMBP batch_get_into_ptr()
-              └── proposed policy controls:
-                    ├── update -> adjust priority or phase TTL
-                    ├── demote -> move key/block from hot tier to colder tier
-                    └── evict  -> release low-value key/block explicitly
-```
-
-这里的 `base_hint_decision` 和 `advanced_hint_decision` 是 scheduler 的策略计算阶段：
-
-- `base_hint_decision` 产出请求级调度计划：选哪个 worker、是否建立或解除 sticky binding、是否打开或关闭后端 session、请求在队列中的顺序，以及预计 decode 负载。
-- `advanced_hint_decision` 产出缓存策略计划：哪些 KV 只做 metadata report、哪些 KV 可以 put 给 UMBP 托管、哪些 KV skip，以及对应的 key、TTL、priority 和 eviction 建议。
-
-UMBP 不直接解释 `session_action`、`priority` 或 `expected_output_tokens`。
-在 `base_hint_decision` 中，UMBP 主要作为 scheduler 的辅助数据面：
-
-- routing 时用 `match_external_kv()` 提供 KV locality 候选。
-- 选定 worker 后，按需 prefetch KV bytes。
-- session close/timeout 后，按 scheduler 记录的 key/block metadata revoke 相关 external KV metadata。
-
-这些 decision 本身不直接搬 KV。Scheduler 会把结果继续翻译成下面的 `worker_action` 和 `umbp_action`。
-
-这里要保持三条边界清晰：
-
-- 推理 worker 负责模型执行、本地 KV cache、KV layout / pointer 暴露，以及消费从 UMBP 取回的 KV。
-- UMBP metadata path 只维护 externally-owned KV 的 hash、tier、node 信息，用于 `match_external_kv()` 这类 advisory routing；这些 external KV blocks 不能通过 UMBP 的 owned-key data path 直接读取 bytes。
-- UMBP-owned bytes path 使用 `batch_put_from_ptr()` / `batch_get_into_ptr()` 托管和取回 KV bytes；peer 持有真实 slot、page location、tier storage 和 eviction 状态。
-- UMBP 可以记录 HBM/DRAM/SSD 等 external tier metadata，也可以托管 peer-owned DRAM/SSD KV bytes；但推理引擎本地 KV cache 的物理生命周期仍由 worker/engine 管理。
-- priority、phase TTL、tier placement 这类 agent-hint policy 不是当前稳定基础数据面；在 v2 中作为 scheduler 下发给 UMBP 的 proposed policy controls。
-- UMBP 不解析 prompt，不理解 `SYSTEM_PROMPT` 或 `TOOL_OUTPUT` 的业务含义。
-
-在这个基础上，`update priority`、`update phase TTL`、`demote`、`evict` 可以作为 v2 为 hints 新增的 policy control 接口。它们不是当前源码已经稳定暴露的基础数据面接口，而是把 scheduler 从“只给 priority / phase TTL 建议”推进到“可以显式调整、降级和释放特定 KV”的闭环控制。
-
-这类新增接口建议保持 key/block-level，而不是 semantic-level：
-
-```text
-update_policy(key_or_block, priority, phase_ttl)
-  adjust retention priority and semantic lifetime
-
-demote(key_or_block, target_tier)
-  move reusable but cold UMBP-owned KV from DRAM to SSD or remote peer tier
-
-evict(key_or_block, reason)
-  release KV that scheduler has classified as low-value or expired
-```
-
-Scheduler 负责把 semantic hints 翻译成这些 key/block-level 控制动作。例如 `SYSTEM_PROMPT` 可以长期保留在 UMBP-owned 热层或持续 report external metadata，`TOOL_OUTPUT` 使用短 TTL 或按需 report，低价值 `RESPONSE` 可以在资源压力下显式 evict。UMBP 仍然只接收 opaque key、block id、tier、phase TTL 和 priority，不需要理解这些 phase 的业务语义。
-
----
-
-## 6. 端到端例子
-
-假设企业报表 Agent 的一次任务包含：
-
-```text
-SYSTEM_PROMPT:  公司统一分析规范，约 3K tokens
-USER_QUERY:     “分析华东区 Q2 销售异常”
-TOOL_OUTPUT:    SQL 查询结果，约 20K tokens
-RESPONSE:       最终中文报告
-```
-
-### 6.1 上层产生并携带 hints
-
-Agent、Harness 或 Agent Orchestrator 可以产生 base hints；Request Frontend 负责把这些 hints 连同请求、tokens 和 KV layout metadata 一起传给 scheduler：
-
-```json
-{
-  "base": {
-    "session_id": "report-task-001",
-    "priority": 5,
-    "expected_output_tokens": 1024,
-    "session_action": "open",
-    "session_timeout_ms": 600000
-  }
-}
-```
-
-如果上层有更丰富的语义上下文，也可以提供 advanced hints：
-
-```json
-{
-  "advanced": {
-    "semantic_spans": [
-      {
-        "token_start": 0,
-        "token_end": 3072,
-        "phase": "SYSTEM_PROMPT",
-        "source": "role:system"
-      },
-      {
-        "token_start": 3072,
-        "token_end": 3120,
-        "phase": "USER_QUERY",
-        "source": "role:user"
-      },
-      {
-        "token_start": 3120,
-        "token_end": 23500,
-        "phase": "TOOL_OUTPUT",
-        "source": "tool_event"
-      }
-    ],
-    "key_identity": {
-      "model_id": "llama-...",
-      "tokenizer_id": "tok-...",
-      "kv_layout_version": "v1",
-      "reuse_scope": "SESSION"
-    }
-  }
-}
-```
-
-### 6.2 Scheduler 决策
-
-Scheduler 把 base hints 和 semantic spans 转成 admission、routing、tier 和 lifecycle 策略：
-
-```text
-SYSTEM_PROMPT:
-  - 生成 canonical key
-  - admission = report
-  - 如果命中率高，升级为 put
-  - priority = high
-  - phase_ttl_ms = long
-
-USER_QUERY:
-  - reuse_scope = SESSION
-  - admission = report
-  - phase_ttl_ms = short
-
-TOOL_OUTPUT:
-  - 如果 policy.admission=skip，或 span 过大且低命中，admission = skip
-  - 如果后续请求或 agent step 会复用，admission = report 或 put
-
-RESPONSE:
-  - admission = skip
-```
-
-### 6.3 UMBP 执行
-
-Scheduler 再把策略落到 UMBP 的 metadata path、bytes path 和 proposed policy controls：
-
-```text
-1. match_external_kv(system_prompt_key)
-   -> 如果已有 worker 持有系统提示词 KV，优先路由过去。
-
-2. report_external_kv_blocks(system_prompt_key, worker, tier, metadata)
-   -> 后续同 session 请求可以通过 UMBP 找到已有 KV。
-
-3. batch_put_from_ptr(system_prompt_key, kv_ptr)
-   -> 对高命中系统提示词，交给 UMBP 托管。
-
-4. update priority / update phase TTL / demote / evict
-   -> 对高价值 KV 提升保留优先级，对短期 user query / tool output 到期降级或释放。
-```
-
-这个例子的重点是：**scheduler 直接把 hints 转成 UMBP 动作**。UMBP 不需要知道“报表”或“SQL”的业务含义，只执行 key、metadata、tier 和 policy controls。
-
----
-
-## 7. 落地阶段
+## 5. 落地阶段
 
 ### 阶段一：Base Hints + Metadata-only Routing
 
@@ -849,7 +658,7 @@ Scheduler 做：
 
 ---
 
-## 8. 设计原则
+## 6. 设计原则
 
 1. **Scheduler owns policy, UMBP executes.** Scheduler 消费 hints 并做策略决策；UMBP 执行 key、metadata、data movement 和 tier 操作。
 2. **Base first, advanced later.** 先落地稳定请求级 hints，再引入 token span 级语义。
@@ -859,7 +668,7 @@ Scheduler 做：
 
 ---
 
-## 9. 小结
+## 7. 小结
 
 UMBP Agent Hints v2 的核心变化是：**从 adapter-centric 改为 scheduler-centric**。
 
