@@ -613,6 +613,50 @@ Scheduler 做：
 
 首期把三类 phase 收敛成两种 admission 动作，并与 `session_action` 联动：
 
+联动优化示意图：
+
+```text
++----------------------+      +----------------------+
+| Session hints        |      | Semantic spans       |
+|----------------------|      |----------------------|
+| session_id           |      | SYSTEM_PROMPT        |
+| session_action       |      | USER_QUERY           |
+| session_timeout_ms   |      | RESPONSE             |
++----------+-----------+      +----------+-----------+
+           |                             |
+           +-------------+---------------+
+                         |
+                         v
+              +----------------------+
+              | Scheduler            |
+              |----------------------|
+              | sticky routing       |
+              | lifecycle handling   |
+              | semantic admission   |
+              +----------+-----------+
+                         |
+          +--------------+--------------+
+          |                             |
+          v                             v
++----------------------+      +----------------------+
+| Shared KV path       |      | Local/session path   |
+|----------------------|      |----------------------|
+| SYSTEM_PROMPT        |      | USER_QUERY/RESPONSE  |
+| prefer L1/L2 hit     |      | skip L3 by default   |
+| prefetch from L3     |      | local prefix cache   |
+| report/put to UMBP   |      | revoke scoped meta   |
+| keep after close     |      | evictable after close|
++----------+-----------+      +----------+-----------+
+           |                             |
+           v                             v
++----------------------+      +----------------------+
+| HiCache + UMBP       |      | HiCache / engine     |
+|----------------------|      |----------------------|
+| L1/L2/L3 coordination|      | L1/L2 capacity policy|
+| cross-worker reuse   |      | future explicit evict|
++----------------------+      +----------------------+
+```
+
 ```text
 SYSTEM_PROMPT:
   高复用价值。
@@ -631,6 +675,10 @@ USER_QUERY / RESPONSE:
 ```
 
 这里 HiCache 负责 worker 内部的 L1/L2/L3 分层缓存执行，包括本地 prefix match、L3 prefetch、L2 load back 和 write-through/selective write。UMBP 在首期主要作为 L3/backend 或 external metadata path，提供跨 worker 的 KV 发现、report/revoke 和可选 bytes put/get。Scheduler 用 hints 决定何时调用 HiCache/UMBP，而不把语义解析下沉到 HiCache 或 UMBP。
+
+对 `SYSTEM_PROMPT` 优先 report/put 的优势是：Agent 场景里的 system prompt 往往包含长系统指令、工具 schema 和固定上下文，占 prompt token 量较大，且在同一 workflow、同类 agent 或多租户安全边界内具有较高复用价值。首次计算后尽早把这部分 KV 推向 UMBP，可以让后续请求即使落到不同 worker，也能通过 L3/UMBP 发现并 prefetch，减少重复 prefill 和本地冷 miss。
+
+相比全量 `write-through`，这种策略不会把一次性的 `USER_QUERY` / `RESPONSE` 默认写入 L3，能降低外部缓存污染、网络写放大和 UMBP 存储压力。相比只依赖底层 `write-through-selective`，scheduler 的 semantic admission 更明确、更早，因此也更快：它能在 prefill 前根据 `SYSTEM_PROMPT`、`USER_QUERY`、`RESPONSE` 判断哪些 KV 应该查 L3、prefetch 或写入 UMBP，而不是等到底层写回阶段再按缓存命中、容量或写回策略做选择；同时，`session_action=close` 可以只清理 session-scoped metadata，不误删可跨 session 复用的 system prompt KV。
 
 收益：
 
