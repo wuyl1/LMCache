@@ -590,50 +590,73 @@ cache_key = hash(
 
 ## 5. 落地阶段
 
-### 阶段一：Base Hints + Metadata-only Routing
+### 阶段一：Session Lifecycle + Semantic Admission
 
-先支持：
+首期先支持最直接影响缓存生命周期和准入的字段：
 
 - `session_id`
-- `priority`
-- `session_timeout_ms`
-- `expected_output_tokens`
 - `session_action`
+- `session_timeout_ms`
+- semantic spans
+- admission `skip / report / put`
 
 Scheduler 做：
 
-- sticky session routing
-- UMBP `match_external_kv()`
-- UMBP `report_external_kv_blocks()`
-- session timeout 到期 revoke metadata
-- priority queueing
+- 用 `session_id` 做 sticky session routing，提高本地 HiCache L1/L2 命中率。
+- 用 `session_action=bind/open/close` 管理路由亲和、后端 session slot 和 session 生命周期边界。
+- 用 `session_timeout_ms` 做 inactivity cleanup，避免漏发 `close` 时长期保留 session 状态。
+- 根据 semantic spans 判断 `SYSTEM_PROMPT`、`USER_QUERY`、`RESPONSE` 的缓存价值；其他 phase 首期不做判别。
+- 用 admission 决定 `skip / report / put`：高复用 prefix 优先 `report` 或 `put`，低价值输出默认 `skip`。
+- 首期以 metadata-only routing 和选择性 admission 为主；只有 key_identity 和 KV layout 足够完整时，才进入 UMBP-owned `put` 路径。
+
+首期只区分两类 semantic spans，并把 `session_action` 和 semantic admission 联合起来：
+
+```text
+SYSTEM_PROMPT:
+  高复用价值。
+  Scheduler 优先路由到本地 HiCache L1/L2 命中的 worker；
+  若本地未命中，可触发 HiCache 从 L3/UMBP prefetch；
+  首次计算后优先 report 或 put 到 L3/UMBP；
+  设置较长 TTL 或较高保留优先级；
+  不随 session_action=close 清理，允许跨 session 或 tenant 复用。
+
+USER_QUERY / RESPONSE:
+  低复用价值。
+  默认 skip L3/UMBP，避免污染外部缓存；
+  只由本地 HiCache / engine 按普通 prefix cache 和容量压力管理；
+  session_action=close 时 revoke session-scoped metadata，并标记为可淘汰；
+  显式驱逐本地 HiCache KV 需要未来 per-span/per-session eviction API 支持。
+```
+
+这里 HiCache 负责 worker 内部的 L1/L2/L3 分层缓存执行：本地 prefix match、L3 prefetch、L2 load back 和 write-through/selective write。UMBP 在首期主要作为 L3/backend 或 external metadata path，提供跨 worker 的 KV 发现、report/revoke 和可选 bytes put/get。Scheduler 用 hints 决定何时调用 HiCache/UMBP，而不把语义解析下沉到 HiCache 或 UMBP。
 
 收益：
 
-- 低风险，不改变 KV bytes 所有权。
-- 先获得 Dynamo 风格的 KV locality 和 routing 收益。
-- 为后续 policy controls 积累命中率、生命周期和 tier 状态数据。
+- 把 session 生命周期和缓存准入先打通，直接服务 agent 多轮、subagent 和 tool-calling 场景。
+- 避免全量 write-through 污染 L3；`SYSTEM_PROMPT` 可以更积极复用，`USER_QUERY` / `RESPONSE` 默认不进入外部缓存。
+- 对当前 UMBP 基础能力依赖较低：优先使用 `match/report/revoke` metadata path，逐步开放安全的 `put`。
+- 为后续 priority、OSL、phase TTL 和 policy controls 积累命中率、生命周期和 tier 状态数据。
 
-### 阶段二：Advanced Semantic Admission
+### 阶段二：Queueing、Load Estimation 与 Phase Policy
 
 加入：
 
-- semantic spans
-- phase
-- admission `skip / report / put`
+- `priority`
+- `expected_output_tokens` / OSL
 - phase-specific TTL / priority
+- 更完整的 canonical key / reuse scope
 
 Scheduler 做：
 
-- `SYSTEM_PROMPT` 优先 report/put
-- `RESPONSE` 默认 skip
-- `TOOL_OUTPUT` 根据 admission 建议、大小、命中统计做 admission
-- 临时上下文不单独引入 phase；默认归入 `USER_QUERY` 或 `TOOL_OUTPUT`，用短 phase TTL 控制
+- 根据 `priority` 做 queue ordering，并把 priority 作为缓存保留策略输入。
+- 根据 `expected_output_tokens` 估算 decode 阶段的 KV 增长和 worker 未来负载。
+- 把 phase 转成默认 TTL、priority 和 fallback admission 策略。
+- 用 canonical key 和 reuse scope 控制跨 session、跨 tenant、跨 worker 的安全复用边界。
 
 收益：
 
-- 减少 cache 污染。
-- 让高价值 KV 更稳定保留。
+- 在首期 admission 基础上补齐调度公平性、负载估计和语义生命周期。
+- 降低高价值 KV 被过早淘汰、低价值 KV 占用热层的概率。
 
 ### 阶段三：UMBP-owned KV 与 Policy Controls
 
@@ -661,7 +684,7 @@ Scheduler 做：
 ## 6. 设计原则
 
 1. **Scheduler owns policy, UMBP executes.** Scheduler 消费 hints 并做策略决策；UMBP 执行 key、metadata、data movement 和 tier 操作。
-2. **Base first, advanced later.** 先落地稳定请求级 hints，再引入 token span 级语义。
+2. **Lifecycle and admission first.** 首期先打通 session 生命周期和语义准入闭环，再扩展 queueing、load estimation 和 policy controls。
 3. **Hints are soft.** Scheduler 可以接受、裁剪、忽略或降级 hints，避免上层过度保护 KV 或污染缓存。
 4. **Semantic value is not reuse correctness.** 语义决定缓存价值和生命周期；canonical key 决定能否安全复用。
 5. **Extend UMBP at key/block level.** 新增 policy controls 应围绕 opaque key、block id、phase TTL、priority 和 tier，不把 Agent 语义下沉到 UMBP core。
