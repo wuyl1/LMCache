@@ -2,6 +2,10 @@
 
 ## 1. 背景与目标
 
+Agent hints 是上层 agent runtime、harness 或编排器传给 serving 系统的请求级提示。它不改变模型语义，也不直接决定 KV 是否可安全复用，而是把 session 生命周期、输出长度、语义阶段、复用范围和缓存价值等信息显式暴露给 scheduler/router，让 serving 层可以更好地做路由、排队、prefetch、admission、TTL 和 eviction 决策。
+
+已有系统分别从不同层次使用类似机制。Sutradhara 把 Agent 编排器看到的 prompt 结构传入推理引擎，通过 `tag_kv_blocks()`、`set_reuse_priority()` 等 thin API 标记 `SYSTEM_PROMPT`、`USER_QUERY`、`TOOL_OUTPUT`、`RESPONSE` 和 `PARTIAL_PREFILL`，让引擎内部的 KV block manager 按语义做复用优先级、驱逐优先级和 partial prefill 生命周期管理。LMCache 当前没有原生 `agent_hints` 字段，也没有 Sutradhara 风格的 token span 级语义标签；它提供的是更通用的外置 KV Cache 管理能力，包括 `lookup`、`store/retrieve`、`pin/unpin`、`move`、`clear`、`compress/decompress`、`cache_salt`、`lmcache.tag.*` 和分层存储。NVIDIA Dynamo 的重点则不是 token span 级语义标记，而是请求级 `nvext.agent_hints`：通过 `prefix_id`、`total_requests`、`osl`、`iat`、`latency_sensitivity`、`priority` 等字段帮助 KV Router 做缓存亲和路由、queueing 和 backend-specific cache behavior。
+
 v1 方案把核心组件设计成 **Semantic KV Adapter**：adapter 位于推理框架和 UMBP 之间，负责把 Agent 语义翻译成 `semantic spans`、`canonical key`、`priority / TTL` 和 `skip / report / put` 决策，再通过 UMBP API 与 UMBP 交互。
 
 v2 方案重新划分控制面：**不再把 adapter 作为 UMBP 的主要交互层，而是让 scheduler 成为 agent hints 的消费方和策略决策方**。这更接近 NVIDIA Dynamo 的思路：上层通过请求级 hints 暴露 session、priority、输出长度和生命周期等信息，serving 层 scheduler/router 根据这些 hints 做路由、排队和 KV cache 策略优化。
